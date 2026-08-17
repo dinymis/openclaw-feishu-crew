@@ -1,0 +1,15 @@
+# 运行时产物与活动数据不入库
+__pycache__/
+*.pyc
+task-state*.json
+task-state*.json.bak.*
+openclaw-workspace-state.json
+media/
+
+# 业务配置层：真实凭证/open_id 不入库，仅提交 *.example 模板
+config/team.json
+config/accounts/*.json
+!config/accounts/*.example
+
+# 真实项目登记（含本地路径），仅提交 projects.example.json
+projects.json

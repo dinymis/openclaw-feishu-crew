@@ -1,0 +1,25 @@
+{
+  "_comment": "team.json 模板。复制为 config/team.json 并填入你自己的值。本模板全部为虚构占位值，不含任何真实数据。",
+  "default_account": "bot01",
+  "accounts": {
+    "bot01": {
+      "engineer": "Alice",
+      "open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "bot02": {
+      "engineer": "Bob",
+      "open_id": "ou_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+    }
+  },
+  "max_attempts": 3,
+  "agents": {
+    "requirement-analyst": {"model_hint": "your-provider/your-model"},
+    "architect": {"model_hint": "your-provider/your-model"},
+    "code-reviewer": {"model_hint": "your-provider/your-model"},
+    "coder": {"model_hint": "your-provider/your-model"},
+    "tester": {"model_hint": "your-provider/your-model"}
+  },
+  "card": {
+    "board_title": "🤖 {engineer}智能体 · 多Agent任务看板"
+  }
+}

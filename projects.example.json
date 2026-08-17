@@ -1,0 +1,32 @@
+{
+  "_comment": "projects.json 模板（虚构示例）。resolve-project.py 按别名解析项目/服务并生成任务前导语。复制为工作区根目录 projects.json 后替换为你自己的项目登记。",
+  "projects": {
+    "demo-shop": {
+      "root": "~/projects/demo-shop",
+      "aliases": ["演示商城", "demo"],
+      "description": "虚构的演示项目：一个小型电商。",
+      "project_agents_md": "~/projects/demo-shop/AGENTS.md",
+      "current_default_service": "api-server",
+      "services": {
+        "web-frontend": {
+          "path": "~/projects/demo-shop/web",
+          "aliases": ["前端", "web"],
+          "git": "https://example.com/demo-shop/web.git",
+          "note": "虚构示例"
+        },
+        "api-server": {
+          "path": "~/projects/demo-shop/api",
+          "aliases": ["后端", "接口服务"],
+          "git": "https://example.com/demo-shop/api.git",
+          "note": "虚构示例"
+        },
+        "common-lib": {
+          "path": "~/projects/demo-shop/common",
+          "aliases": ["公共库"],
+          "git": "https://example.com/demo-shop/common.git",
+          "note": "虚构示例"
+        }
+      }
+    }
+  }
+}

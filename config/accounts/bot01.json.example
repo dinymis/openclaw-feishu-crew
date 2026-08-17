@@ -1,0 +1,5 @@
+{
+  "_comment": "accounts/<account_id>.json 模板。复制为 config/accounts/<account_id>.json（文件名 = team.json accounts 段的 key），填入该飞书自建应用的凭证。",
+  "app_id": "cli_xxxxxxxxxxxxxxxx",
+  "app_secret": "your-app-secret-here"
+}
