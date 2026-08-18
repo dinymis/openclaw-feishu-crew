@@ -8,10 +8,11 @@
     python3 tests/smoke_test.py
 
 覆盖命令链路（与生产调用等价）：
-    board / assign / set-result / complete
+    board / assign / set-result / complete / stop / clear
 状态迁移断言：
     assign 后任务 running；set-result 后 review；complete 后 done；
-    看板卡片每次状态变化都被刷新。
+    看板卡片每次状态变化都被刷新；
+    clear 仅终态可清、非终态拒绝、清除后 board 不显示且 history 保留。
 """
 
 import json
@@ -109,5 +110,36 @@ check("编码猴释放", state["agents"]["coder"]["status"] == "idle")
 print("== 6) board 刷新（同卡片原地 PATCH） ==")
 r = pipeline.show_board()
 check("board 二次刷新", r.get("code") == 0 and r["data"]["message_id"] == state["board_message_id"])
+
+print("== 7) clear（终态清除/非终态拒绝） ==")
+# 非终态拒绝：新建一个 running 任务尝试 clear
+r = pipeline.add_adhoc_task("coder", "冒烟测试任务：虚构需求 B（clear 用例）")
+check("assign B ok", r.get("ok"), r.get("msg"))
+rid = r["task_id"]
+r = pipeline.clear_task(rid)
+check("非终态 clear 拒绝", (not r.get("ok")) and "stop/complete" in r.get("msg", ""), r.get("msg", ""))
+check("被拒后任务仍在", rid in pipeline.load_state()["tasks"])
+
+# 终态可清：stop 后清除
+r = pipeline.stop_task(rid)
+check("stop B ok", r.get("ok"))
+r = pipeline.clear_task(rid)
+check("终态 clear ok", r.get("ok"), r.get("msg"))
+state = pipeline.load_state()
+check("清除后 tasks 无该任务", rid not in state["tasks"])
+check("history 保留记录", any(h.get("id") == rid for h in state.get("history", [])))
+
+# 清除后 board 不显示：build_board 渲染文本不含已清除任务 id
+card = pipeline.build_board(state)
+board_text = card["elements"][0]["text"]["content"]
+check("board 不显示已清除任务", rid not in board_text)
+
+# history 命令仍可查到
+r = pipeline.show_history()
+check("history 含已清除任务", any(h.get("id") == rid for h in r["history"]))
+
+# 不存在的任务
+r = pipeline.clear_task("task-not-exist")
+check("不存在任务 clear 拒绝", not r.get("ok"), r.get("msg"))
 
 print(f"\nSMOKE PASS: {PASS} checks, state file = {pipeline.state_file()}")

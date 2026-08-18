@@ -692,6 +692,37 @@ def error_task(task_id, error_text):
     }
 
 
+CLEARABLE_STATUS = ("done", "error", "stopped")
+
+
+def clear_task(task_id):
+    """Remove a terminal-state task from the board.
+
+    Only done / error / stopped tasks can be cleared; running / review /
+    pending tasks are rejected (stop or complete them first). The cleared
+    task is archived into state["history"] by default so `history` keeps
+    showing it, while the board and `detail` no longer list it.
+    """
+    state = load_state()
+    task = state["tasks"].get(task_id)
+    if not task:
+        return {"ok": False, "msg": "任务不存在"}
+    if task["status"] not in CLEARABLE_STATUS:
+        return {
+            "ok": False,
+            "msg": f"仅终态任务（done/error/stopped）可清除，当前状态：{task['status']}，请先 stop/complete",
+        }
+    release_agent(state, task["agent"])
+    # 默认保留 history 记录：归档快照后从 tasks 移除。
+    snapshot = dict(task)
+    snapshot["cleared_at"] = now()
+    state["history"].append(snapshot)
+    del state["tasks"][task_id]
+    save_state(state)
+    update_board(state)
+    return {"ok": True, "msg": f"已清除（history 保留记录）：{task['title']}", "task_id": task_id}
+
+
 def release_agent_cmd(agent_id):
     state = load_state()
     if agent_id not in AGENTS:
@@ -952,8 +983,12 @@ def get_task_detail(task_id):
 
 def show_history():
     state = load_state()
-    history = sorted(
-        [t for t in state["tasks"].values() if t["status"] in ("done", "stopped")],
+    history = [t for t in state["tasks"].values() if t["status"] in ("done", "stopped")]
+    # clear 命令归档的任务快照同样计入历史。
+    for h in state.get("history", []):
+        if isinstance(h, dict) and h.get("id"):
+            history.append(h)
+    history.sort(
         key=lambda x: x.get("completed_at") or x.get("created_at") or "",
         reverse=True,
     )
@@ -987,7 +1022,7 @@ def dispatch_natural(text):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: BOARD_ACCOUNT=<bot01|bot02|...> [BOARD_OPEN_ID=<open_id>] pipeline.py <board|agent-detail|start|assign|dispatch|complete|review|stop|release|set-result|record-run|fail|error|detail|history> [args]")
+        print("Usage: BOARD_ACCOUNT=<bot01|bot02|...> [BOARD_OPEN_ID=<open_id>] pipeline.py <board|agent-detail|start|assign|dispatch|complete|review|stop|release|set-result|record-run|fail|error|detail|history|clear> [args]")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -1078,6 +1113,12 @@ def main():
         print(json.dumps(result, indent=2, ensure_ascii=False))
     elif cmd == "history":
         result = show_history()
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif cmd == "clear":
+        if len(sys.argv) < 3:
+            print("Usage: pipeline.py clear <task_id>")
+            sys.exit(1)
+        result = clear_task(sys.argv[2])
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         print(f"Unknown command: {cmd}")

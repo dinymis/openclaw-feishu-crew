@@ -62,10 +62,18 @@ python3 scripts/pipeline.py error <task_id> <错误>     # 失败（不可重试
 python3 scripts/pipeline.py release <agent_id>         # 释放猴
 python3 scripts/pipeline.py detail <task_id>           # 任务详情
 python3 scripts/pipeline.py history                    # 历史任务
+python3 scripts/pipeline.py clear <task_id>            # 清除终态任务（仅 done/error/stopped；默认保留 history 记录）
 
 # 项目路径解析（别名 → 任务前导语，含「必读项目 AGENTS.md」指令注入）
 python3 scripts/resolve-project.py <项目别名> [服务别名]
 ```
+
+### fail/retry 行为说明
+
+- `fail <task_id> <错误>` 用于瞬时错误（限流/超时/5xx/配额等）。任务**保持 running**（内部经 pending 重新分配），看板 summary 标注「上次失败，准备自动重试 N/M」，`attempts` 递增；
+- 不存在独立的 `waiting_retry` 中间态：`fail` 返回 `retry=true` 后，由**编排方（协调猴）**负责用 `sessions_spawn(agentId=...)` 重新拉起子会话继续任务；
+- 重试耗尽（默认 `max_attempts=3`，可在 team.json 配置）后任务转 **error** 终态，需人工介入；
+- 权限/配置类错误请用 `error`（不可自动重试），避免无意义的反复重试。
 
 ## 冒烟验收边界
 
