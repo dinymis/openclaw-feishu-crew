@@ -1,0 +1,155 @@
+// =============================================================================
+// openclaw.example.json — OpenClaw 多 Agent 团队协作配置模板（JSON5，可直接抄）
+//
+// 本文件是虚构示例，不含任何真实凭证。拷贝为你的 ~/.openclaw/openclaw.json
+// 后替换占位值即可。文件为 JSON5（允许注释）；若你的工具链要求严格 JSON，
+// 删掉注释即为合法 JSON。
+//
+// 整体结构五段：
+//   1. channels.feishu.accounts —— 飞书多 bot 账号（账号即工程师）
+//   2. agents.list              —— coordinator + 五只角色猴
+//   3. coordinator 条目内的 subagents.allowAgents —— 派活白名单【坑 1】
+//   4. tools.agentToAgent.allow —— 跨 agent 通信白名单【坑 2】
+//   5. bindings                 —— 飞书会话路由到 coordinator
+//
+// ⚠️ 两处白名单是最易踩的坑：
+//   - subagents.allowAgents 缺了某只猴 → sessions_spawn(agentId=...) 直接报
+//     "agent not allowed"，流水线卡死在派活阶段；
+//   - tools.agentToAgent.allow 缺了某只猴 → 子猴无法被拉起/回执无法送达，
+//     看板任务停在 running。
+//   每新增一只猴，两处白名单必须同步加，缺一不可。
+// =============================================================================
+{
+  // ---------------------------------------------------------------------------
+  // 1. 飞书多账号：每个 bot 应用 = 一位工程师
+  //    到飞书开放平台为每位工程师创建一个「自建应用」，
+  //    把 app_id / app_secret 填到对应账号下。
+  //    account_id（bot01/bot02…）即看板状态文件 task-state-<account_id>.json
+  //    的区分键，也是 bindings 路由与 pipeline.py 的 BOARD_ACCOUNT 取值。
+  // ---------------------------------------------------------------------------
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      // 未匹配到 bindings 时的兜底账号
+      "defaultAccount": "bot01",
+      "accounts": {
+        "bot01": {
+          "appId": "cli_xxxxxxxxxxxxxxxx",
+          "appSecret": "***"
+        },
+        "bot02": {
+          "appId": "cli_yyyyyyyyyyyyyyyy",
+          "appSecret": "***"
+        },
+        "bot03": {
+          "appId": "cli_zzzzzzzzzzzzzzzz",
+          "appSecret": "***"
+        }
+        // 按工程师人数继续追加 bot04 / bot05 …
+      }
+    }
+  },
+
+  // ---------------------------------------------------------------------------
+  // 2. agents.list：coordinator（协调猴）+ 五只角色猴
+  //    每只猴一个独立 workspace（工作区）与 agentDir（agent 配置目录），
+  //    互不可见；model 换成你自己接入的 provider/model。
+  // ---------------------------------------------------------------------------
+  "agents": {
+    "defaults": {
+      // 未单独指定 workspace 的 agent 的公共根目录
+      "workspace": "/home/you/.openclaw/workspace",
+      "model": {
+        "primary": "your-provider/your-model"
+      }
+    },
+    "list": [
+      {
+        // 协调猴：唯一面向用户的入口，管看板、派活、拉子猴、收结果
+        "id": "coordinator",
+        "workspace": "/home/you/.openclaw/workspace/coordinator",
+        "agentDir": "/home/you/.openclaw/agents/coordinator/agent",
+        "model": "your-provider/your-model",
+        // ⚠️ 坑 1：派活白名单。sessions_spawn(agentId=...) 只允许这里的 id。
+        // 五只角色猴 + 自己（允许递归委派），新增猴必须同步加。
+        "subagents": {
+          "allowAgents": [
+            "coordinator",
+            "requirement-analyst",
+            "architect",
+            "coder",
+            "code-reviewer",
+            "tester"
+          ]
+        }
+      },
+      // ---- 以下五只角色猴，按流水线顺序：需求 → 架构 → 编码 → 质检 → 测试 ----
+      {
+        "id": "requirement-analyst",   // 需求猴：拆解需求、产出需求文档
+        "name": "requirement-analyst",
+        "workspace": "/home/you/.openclaw/workspace/requirement-analyst",
+        "agentDir": "/home/you/.openclaw/agents/requirement-analyst",
+        "model": "your-provider/your-model"
+      },
+      {
+        "id": "architect",             // 架构猴：技术方案、开发指南
+        "name": "architect",
+        "workspace": "/home/you/.openclaw/workspace/architect",
+        "agentDir": "/home/you/.openclaw/agents/architect",
+        "model": "your-provider/your-model"
+      },
+      {
+        "id": "coder",                 // 编码猴：写代码
+        "name": "coder",
+        "workspace": "/home/you/.openclaw/workspace/coder",
+        "agentDir": "/home/you/.openclaw/agents/coder",
+        "model": "your-provider/your-model"
+      },
+      {
+        "id": "code-reviewer",         // 质检猴：代码审查
+        "name": "code-reviewer",
+        "workspace": "/home/you/.openclaw/workspace/code-reviewer",
+        "agentDir": "/home/you/.openclaw/agents/code-reviewer",
+        "model": "your-provider/your-model"
+      },
+      {
+        "id": "tester",                // 测试猴：测试用例与验收
+        "name": "tester",
+        "workspace": "/home/you/.openclaw/workspace/tester",
+        "agentDir": "/home/you/.openclaw/agents/tester",
+        "model": "your-provider/your-model"
+      }
+    ]
+  },
+
+  // ---------------------------------------------------------------------------
+  // 3. tools.agentToAgent：跨 agent 通信总开关 + 白名单
+  //    ⚠️ 坑 2：这里的 allow 与上面 subagents.allowAgents 是两道独立闸门，
+  //    少配任何一处，对应角色猴都拉不起来。
+  // ---------------------------------------------------------------------------
+  "tools": {
+    "agentToAgent": {
+      "enabled": true,
+      "allow": [
+        "coordinator",
+        "requirement-analyst",
+        "architect",
+        "coder",
+        "code-reviewer",
+        "tester"
+      ]
+    }
+  },
+
+  // ---------------------------------------------------------------------------
+  // 4. bindings：会话路由 —— 把每个飞书 bot 的私聊/群聊消息都路由给 coordinator
+  //    「账号即工程师」的关键：用户找任一 bot 说话，都由协调猴统一接单，
+  //    再由协调猴按看板状态决定派给哪只角色猴。
+  //    每新增一个 bot 账号，记得在此追加一条 match。
+  // ---------------------------------------------------------------------------
+  "bindings": [
+    { "agentId": "coordinator", "match": { "channel": "feishu", "accountId": "bot01" } },
+    { "agentId": "coordinator", "match": { "channel": "feishu", "accountId": "bot02" } },
+    { "agentId": "coordinator", "match": { "channel": "feishu", "accountId": "bot03" } }
+  ]
+}

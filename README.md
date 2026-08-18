@@ -24,14 +24,15 @@ OpenClaw 单 agent 会话是「一个全能助理」；本项目把它变成「�
 ## 快速上手（五步）
 
 1. **建飞书应用**：在飞书开放平台为每位工程师创建一个自建应用（bot），记下每个应用的 `app_id` / `app_secret`；
-2. **配 OpenClaw 多账号**：在 `openclaw.json` 的 `channels.feishu.accounts.<account_id>` 填入各应用凭证，并在 `agents.list` 定义 coordinator 与各角色猴的 agent id；
+2. **配 OpenClaw 多账号**：复制 `openclaw.example.json` 为你的 OpenClaw 配置（或并入现有配置），在 `channels.feishu.accounts.<account_id>` 填入各应用凭证——模板里已标注 `agents.list`、两处白名单（`subagents.allowAgents` / `tools.agentToAgent.allow`，最易踩的坑）与 `bindings` 的填法；
 3. **部署本仓库**：把本仓库拷入 coordinator 工作区（`scripts/` + `config/` + `projects.json`）；
 4. **填配置**：按 `config/README.md` 复制 `*.example` 为真实配置文件并填入凭证 / open_id / 工程师昵称；
 5. **看第一张看板**：对任一 bot 说「看板」（协调猴执行 `pipeline.py board`），一张带刷新按钮的飞书卡片即出现在对话里。
 
 ## 配置说明
 
-- 配置层结构与优先级、占位符填写方法见 **`config/README.md`**；
+- 配置层结构与优先级、占位符填写方法见 **`config/README.md`**；OpenClaw 侧的多 agent / 多账号配置模板见 **`openclaw.example.json`**；
+- 整体架构（账号→工程师→看板→五猴流水线与状态机）见 **`docs/architecture.md`**；
 - 代码不含业务敏感值，配置缺失时自动退化到代码默认值；
 - 环境变量：`BOARD_ACCOUNT`（当前工程师账号 id）、`BOARD_OPEN_ID`（发送者 open_id）由协调猴在每次调用时传入。
 
