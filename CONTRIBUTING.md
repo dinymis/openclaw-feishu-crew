@@ -20,8 +20,8 @@
 ## 提交流程
 
 1. Fork 本仓库并创建特性分支：`git checkout -b feat/xxx`
-2. 本地跑一遍冒烟测试：`python3 tests/smoke_test.py`（应输出 `SMOKE PASS`）
-3. 提交前自查敏感信息：`grep -rInE 'ou_[0-9a-f]{10,}|github_pat_|ghp_[A-Za-z0-9]{30,}|app_secret' . --exclude-dir=.git` 应为 0 命中
+2. 本地跑一遍测试：`python3 tests/smoke_test.py`（应输出 `SMOKE PASS`）与 `python3 tests/doctor_test.py`（应输出 `DOCTOR TEST PASS`）
+3. 提交前自查敏感信息：`grep -rInE 'ou_[0-9a-f]{10,}|[g]ithub_pat_|ghp_[A-Za-z0-9]{30,}|app_secret' . --exclude-dir=.git` 应为 0 命中（`[g]` 写法避免示例命令自身命中）
 4. 提交 PR，说明动机、改动点与验证方式
 
 ## 提交信息风格

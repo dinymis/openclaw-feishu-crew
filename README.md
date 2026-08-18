@@ -27,7 +27,7 @@ OpenClaw 单 agent 会话是「一个全能助理」；本项目把它变成「�
 2. **配 OpenClaw 多账号**：复制 `openclaw.example.json` 为你的 OpenClaw 配置（或并入现有配置），在 `channels.feishu.accounts.<account_id>` 填入各应用凭证——模板里已标注 `agents.list`、两处白名单（`subagents.allowAgents` / `tools.agentToAgent.allow`，最易踩的坑）与 `bindings` 的填法；
 3. **部署本仓库**：把本仓库拷入 coordinator 工作区（`scripts/` + `config/` + `projects.json`）；
 4. **填配置**：按 `config/README.md` 复制 `*.example` 为真实配置文件并填入凭证 / open_id / 工程师昵称；
-5. **看第一张看板**：对任一 bot 说「看板」（协调猴执行 `pipeline.py board`），一张带刷新按钮的飞书卡片即出现在对话里。
+5. **自检**：`python3 scripts/doctor.py`——全绿后 `openclaw gateway restart`，对任一 bot 说「看板」即可看到第一张卡片。
 
 ## 配置说明
 
@@ -39,6 +39,10 @@ OpenClaw 单 agent 会话是「一个全能助理」；本项目把它变成「�
 ## 命令速查
 
 ```bash
+# 一键自检（填完两份配置后先跑这个，全绿再 restart）
+python3 scripts/doctor.py            # 全量检查（含飞书凭证连通性探测）
+python3 scripts/doctor.py --offline  # 无网环境：跳过连通性探测
+
 # 环境变量：BOARD_ACCOUNT=<bot01|bot02|...> [BOARD_OPEN_ID=<open_id>]
 python3 scripts/pipeline.py board                      # 查看/刷新看板卡片
 python3 scripts/pipeline.py agent-detail <agent_id>    # 查看某只猴的详情卡片
@@ -62,8 +66,21 @@ python3 scripts/resolve-project.py <项目别名> [服务别名]
 
 ## 冒烟验收边界
 
-- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；
+- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；
 - 真实飞书卡片收发需要有效应用凭证与 open_id：未配置凭证时 `board` 等涉及卡片的命令会在发送阶段报错，属预期行为——请先按「快速上手」配置。
+
+## 常见问题 FAQ
+
+| 症状 | 原因 | 解法 |
+|---|---|---|
+| 飞书接口报错 `99991672` / `Access denied scope` | 自建应用的 API 权限没开齐，或开了权限但没发布新版本（权限未生效） | 在开放平台「权限管理」开通机器人消息收发、卡片相关 scope，然后**创建新版本并发布**，再重试 |
+| bot 收到消息但不回 | 白名单漏配（`subagents.allowAgents` 或 `tools.agentToAgent.allow`），或开放平台「事件订阅」没开/没订阅消息事件 | 两处白名单补齐（见 `openclaw.example.json` 注释里的坑 1/坑 2）；开放平台开启事件订阅并订阅 `im.message.receive_v1`，发布新版本 |
+| 卡片发送失败，HTTP 400 | 应用缺少卡片（interactive message card）相关权限 | 在开放平台开通卡片发送相关权限并发布新版本；先用 doctor 确认凭证本身有效 |
+| 跨 bot 发消息报错 `99992361`（接收者不存在/无权限） | open_id 是 **per-app** 的：同一个人在不同 bot 应用下的 open_id 不同，拿 A bot 里取到的 open_id 去让 B bot 发消息就会报这个错 | 每个 bot 各自获取对方的 open_id（如从该 bot 的消息事件 sender 元数据），team.json 里按账号分别填；不确定时用 `BOARD_OPEN_ID` 显式传入 |
+| 看板不出卡片 | `BOARD_ACCOUNT` / `BOARD_OPEN_ID` 环境变量没传对（账号 id 拼错、open_id 为空） | `BOARD_ACCOUNT` 必须是 team.json accounts 段的 key（如 bot01）；`BOARD_OPEN_ID` 填该 bot 下的真实 open_id；先跑 `python3 scripts/doctor.py` 排查 |
+| doctor 报 account_id 不对齐 | team.json accounts 表、config/accounts/ 凭证文件、openclaw.json `channels.feishu.accounts` 三处账号清单不一致 | 按 doctor 的 ❌ 提示补齐缺失的一侧；新增 bot 时三处同步加 |
+
+> FAQ 覆盖的症状均为真实踩坑沉淀。配置类问题先跑 `python3 scripts/doctor.py` 定位，能省一半排查时间。
 
 ## 目录结构
 
@@ -74,6 +91,7 @@ openclaw-feishu-crew/
 ├── .gitignore                 # 真实凭证/看板状态不入库
 ├── scripts/
 │   ├── pipeline.py            # 核心：看板状态机 + 命令层（配置分层版）
+│   ├── doctor.py              # 一键自检：配置完整性/对齐/凭证连通性
 │   └── resolve-project.py     # 项目别名 → 任务前导语
 ├── config/
 │   ├── README.md              # 配置层说明与优先级
@@ -82,7 +100,8 @@ openclaw-feishu-crew/
 │       └── bot01.json.example # per-account 飞书凭证模板
 ├── projects.example.json      # 项目登记模板（虚构 demo-shop）
 └── tests/
-    └── smoke_test.py          # 离线冒烟：状态机闭环验收
+    ├── smoke_test.py          # 离线冒烟：状态机闭环验收
+    └── doctor_test.py         # doctor 自测：全绿/缺配置两条路径
 ```
 
 ## 安全与边界
