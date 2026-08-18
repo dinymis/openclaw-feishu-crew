@@ -16,6 +16,8 @@ OpenClaw 单 agent 会话是「一个全能助理」；本项目把它变成「�
 - **派活闭环**：`assign` 登记看板 → 协调猴用 `sessions_spawn(agentId=...)` 拉起子猴 → `record-run` 记录子会话 → 成功后 `set-result` / `complete`；
 - **重试纪律**：`fail`（瞬时错误，任务级退避重试，默认 max_attempts=3）vs `error`（权限/配置类，不重试）。
 
+**镜像层（可选）**：pipeline 台账还可单向只读镜像到 OpenClaw Workboard 插件（Control UI 看板），每个账号一块 `pipeline-<account>` board，供管理端观察任务流转。镜像层完全独立、单向（台账是唯一事实源）、失败静默降级不阻塞主流程——**未启用 workboard 插件时触发即静默跳过，零影响**；设计见 [docs/workboard-bridge.md](docs/workboard-bridge.md)。
+
 ## 依赖清单
 
 | 依赖 | 说明 |
@@ -93,6 +95,11 @@ python3 scripts/pipeline.py detail <task_id>           # 任务详情
 python3 scripts/pipeline.py history                    # 历史任务
 python3 scripts/pipeline.py clear <task_id>            # 清除终态任务（仅 done/error/stopped；默认保留 history 记录）
 
+# Workboard 镜像层（可选，需启用 OpenClaw Workboard 插件；未启用时静默跳过）
+python3 scripts/workboard-mirror.py reconcile <account_id>   # 全量对账：以台账为准补齐差异（存量任务首次同步也用它）
+python3 scripts/workboard-mirror.py event <account_id> <task_id>   # 单任务事件同步（pipeline.py 各命令成功后自动触发，一般无需手动）
+python3 scripts/workboard-mirror.py cleanup <account_id> <task_id> ...  # 清理指定任务的镜像卡
+
 # 项目路径解析（别名 → 任务前导语，含「必读项目 AGENTS.md」指令注入）
 python3 scripts/resolve-project.py <项目别名> [服务别名]
 ```
@@ -106,7 +113,7 @@ python3 scripts/resolve-project.py <项目别名> [服务别名]
 
 ## 冒烟验收边界
 
-- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；`tests/setup_test.py` 验证 setup.py 骨架生成 / 幂等 / `--apply` 备份（均为临时目录虚构配置，不碰仓库 config/）；
+- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；`tests/setup_test.py` 验证 setup.py 骨架生成 / 幂等 / `--apply` 备份（均为临时目录虚构配置，不碰仓库 config/）；`tests/mirror_test.py` 用 mock RPC 验证镜像层状态映射 / 红线断言 / 主链路 / 失败降级（不依赖真实 gateway）；
 - 真实飞书卡片收发需要有效应用凭证与 open_id：未配置凭证时 `board` 等涉及卡片的命令会在发送阶段报错，属预期行为——请先按「快速上手」配置。
 
 ## 常见问题 FAQ
@@ -135,6 +142,7 @@ openclaw-feishu-crew/
 ├── scripts/
 │   ├── setup.py               # 一键初始化（生成配置骨架 + doctor 自检，幂等）
 │   ├── pipeline.py            # 核心：看板状态机 + 命令层（配置分层版）
+│   ├── workboard-mirror.py    # 可选：pipeline → Workboard 单向镜像层
 │   ├── doctor.py              # 一键自检（含 --fix 交互补全）
 │   ├── add-engineer.py        # 一键新增工程师（三处同步 + doctor 复查）
 │   └── resolve-project.py     # 项目别名 → 任务前导语
@@ -145,12 +153,14 @@ openclaw-feishu-crew/
 │       └── bot01.json.example # per-account 飞书凭证模板
 ├── docs/
 │   ├── architecture.md        # 整体架构与状态机说明
+│   ├── workboard-bridge.md    # Workboard 镜像层设计（单向只读，可选）
 │   └── feishu-app-setup.md    # 飞书自建应用搭建 SOP
 ├── projects.example.json      # 项目登记模板（虚构 demo-shop）
 └── tests/
     ├── smoke_test.py          # 离线冒烟：状态机闭环验收
     ├── doctor_test.py         # doctor / add-engineer / --fix 自测
-    └── setup_test.py          # setup.py 一键初始化自测（骨架/幂等/--apply 备份）
+    ├── setup_test.py          # setup.py 一键初始化自测（骨架/幂等/--apply 备份）
+    └── mirror_test.py         # 镜像层自测（状态映射 + mock RPC，不依赖真实 gateway）
 ```
 
 ## 安全与边界

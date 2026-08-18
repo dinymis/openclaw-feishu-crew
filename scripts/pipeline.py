@@ -353,6 +353,37 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+# --- Workboard 镜像层（1 档，单向只读镜像，可选功能） -----------------
+# 设计文档：docs/workboard-bridge.md
+# pipeline 台账是唯一事实源；镜像失败由镜像层自行降级（pending_ops），
+# 绝不阻塞主流程、绝不抛异常。未启用 workboard 插件/gateway 不可达时
+# 触发器与镜像层均静默降级，不影响任何 pipeline 命令。
+# 回滚本层：删除下方各命令尾部的 _trigger_workboard_mirror(...) 调用即可，
+# 镜像层其余部分完全独立。
+def _trigger_workboard_mirror(task_ids, comment=None):
+    """命令成功后异步触发 workboard-mirror.py event（不等待、不读返回）。"""
+    try:
+        script = os.path.join(SCRIPT_DIR, "workboard-mirror.py")
+        if not os.path.exists(script):
+            return
+        for tid in task_ids:
+            if not tid:
+                continue
+            cmd = [sys.executable, script, "event", CURRENT_ACCOUNT, tid]
+            if comment:
+                cmd += ["--comment", comment]
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except Exception:
+        # 触发器自身静默失败，绝不影响主流程
+        pass
+
+
 def new_task_id():
     return f"task-{int(time.time())}-{uuid.uuid4().hex[:6]}"
 
@@ -487,8 +518,10 @@ def add_adhoc_task(agent_id, title):
     if not ok:
         # Keep it pending; it will queue for that agent.
         save_state(state)
+        _trigger_workboard_mirror([task_id])
         return {"ok": True, "msg": f"任务已创建并排队（{err}）", "task_id": task_id}
     save_state(state)
+    _trigger_workboard_mirror([task_id])
     update_board(state)
     return {"ok": True, "msg": f"已分配给 {AGENTS[agent_id]['name']}", "task_id": task_id}
 
@@ -512,9 +545,11 @@ def start_pipeline(title):
     ok, err = start_task_assignment(state, first_task_id)
     if not ok:
         save_state(state)
+        _trigger_workboard_mirror([tid for tid, _ in created])
         return {"ok": True, "msg": f"流水线已创建，阶段1排队中（{err}）", "parent_id": parent_id}
 
     save_state(state)
+    _trigger_workboard_mirror([tid for tid, _ in created])
     update_board(state)
     return {"ok": True, "msg": f"流水线启动：{title}", "parent_id": parent_id}
 
@@ -534,6 +569,7 @@ def complete_task(task_id):
     task["progress"] = 100
 
     # Auto-start next pipeline stage if applicable.
+    next_task_id = None
     if task.get("parent_id") and task.get("sequence"):
         next_seq = task["sequence"] + 1
         next_task = None
@@ -545,8 +581,10 @@ def complete_task(task_id):
             started, err = start_task_assignment(state, next_task["id"])
             if started:
                 state["tasks"][next_task["id"]]["result"] = "（前置阶段已完成，自动开始）"
+            next_task_id = next_task["id"]
 
     save_state(state)
+    _trigger_workboard_mirror([task_id, next_task_id])
     update_board(state)
     return {"ok": True, "msg": f"任务完成：{task['title']}"}
 
@@ -560,6 +598,7 @@ def review_task(task_id):
         return {"ok": False, "msg": f"当前不是进行中，无法提交审核：{task['status']}"}
     task["status"] = "review"
     save_state(state)
+    _trigger_workboard_mirror([task_id])
     update_board(state)
     return {"ok": True, "msg": f"已提交审核：{task['title']}"}
 
@@ -576,6 +615,7 @@ def stop_task(task_id):
     task["status"] = "stopped"
     task["completed_at"] = now()
     save_state(state)
+    _trigger_workboard_mirror([task_id])
     update_board(state)
     return {"ok": True, "msg": f"已停止：{task['title']}"}
 
@@ -590,6 +630,7 @@ def set_task_result(task_id, result_text, summary=None):
     if task["status"] == "running":
         task["status"] = "review"
     save_state(state)
+    _trigger_workboard_mirror([task_id])
     update_board(state)
     return {"ok": True, "msg": f"结果已保存：{task['title']}"}
 
@@ -604,6 +645,7 @@ def record_task_run(task_id, run_id=None, child_session_key=None):
     if child_session_key:
         task["child_session_key"] = child_session_key
     save_state(state)
+    _trigger_workboard_mirror([task_id])
     update_board(state)
     return {"ok": True, "msg": f"运行信息已记录：{task['title']}"}
 
@@ -632,6 +674,11 @@ def fail_task(task_id, error_text):
         task["completed_at"] = None
         ok, err = start_task_assignment(state, task_id)
         save_state(state)
+        # fail 重试期：卡片保持 running，仅追加重试 comment（见设计文档边界）
+        _trigger_workboard_mirror(
+            [task_id],
+            comment=f"第 {task['attempts']}/{max_attempts} 次重试：{error_text[:80]}",
+        )
         update_board(state)
         if ok:
             return {
@@ -649,6 +696,7 @@ def fail_task(task_id, error_text):
     task["completed_at"] = now()
     task["summary"] = f"重试耗尽 {attempts}/{max_attempts}：{error_text[:120]}"
     save_state(state)
+    _trigger_workboard_mirror([task_id])
     update_board(state)
     return {
         "ok": True,
@@ -680,6 +728,7 @@ def error_task(task_id, error_text):
     task["summary"] = f"不可自动重试（权限/配置类）：{error_text[:120]}"
     task["completed_at"] = now()
     save_state(state)
+    _trigger_workboard_mirror([task_id])
     update_board(state)
     return {
         "ok": True,
@@ -719,6 +768,8 @@ def clear_task(task_id):
     state["history"].append(snapshot)
     del state["tasks"][task_id]
     save_state(state)
+    # 台账已移除该任务：镜像层将归档孤儿卡（clear 归档语义，见设计文档）
+    _trigger_workboard_mirror([task_id])
     update_board(state)
     return {"ok": True, "msg": f"已清除（history 保留记录）：{task['title']}", "task_id": task_id}
 
@@ -735,6 +786,7 @@ def release_agent_cmd(agent_id):
             task["completed_at"] = now()
     release_agent(state, agent_id)
     save_state(state)
+    _trigger_workboard_mirror(current)
     update_board(state)
     return {"ok": True, "msg": f"{AGENTS[agent_id]['name']} 已释放"}
 
