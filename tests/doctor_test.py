@@ -144,4 +144,89 @@ code, out = run_doctor(d4, offline=True)
 check("对齐失败 exit!=0", code != 0)
 check("报缺账号", "channels.feishu.accounts 缺" in out and "bot02" in out)
 
+print("== 6) doctor --fix 交互路径（mock input，先缺后补全→绿） ==")
+d5 = tempfile.mkdtemp(prefix="doctor-fix-")
+accounts_dir = os.path.join(d5, "accounts")
+os.makedirs(accounts_dir, exist_ok=True)
+# 初始：team.json 两账号 + 占位 open_id（ou_xxx），凭证占位
+with open(os.path.join(d5, "team.json"), "w", encoding="utf-8") as f:
+    json.dump({"default_account": "bot01",
+               "accounts": {
+                   "bot01": {"engineer": "Alice",
+                             "open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"},
+                   "bot02": {"engineer": "Bob",
+                             "open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"},
+               },
+               "agents": {"coder": {"model_hint": "your-provider/your-model"}}}, f)
+for aid in ("bot01", "bot02"):
+    with open(os.path.join(accounts_dir, f"{aid}.json"), "w", encoding="utf-8") as f:
+        json.dump({"app_id": "cli_xxxxxxxxxxxxxxxx", "app_secret": "your-app-secret-here"}, f)
+
+# 模拟用户交互：依次回答 bot01/bot02 的 open_id，再 bot01/bot02 的 app_id/app_secret
+import builtins  # noqa: E402
+_fix_inputs = iter([
+    "ou_fakebot01openid000000000000",  # bot01 open_id
+    "ou_fakebot02openid000000000000",  # bot02 open_id
+    "cli_fakebot01000000", "fake-secret-01",  # bot01 app_id/app_secret
+    "cli_fakebot02000000", "fake-secret-02",  # bot02 app_id/app_secret
+])
+_orig_input = builtins.input
+builtins.input = lambda *a, **k: next(_fix_inputs)
+try:
+    os.environ["PIPELINE_CONFIG_DIR"] = d5
+    os.environ["DOCTOR_FEISHU_TOKEN_URL"] = TOKEN_URL
+    os.environ["OPENCLAW_CONFIG_PATH"] = os.path.join(d5, "openclaw.json")
+    buf = io.StringIO()
+    code = doctor.run_fix(out=buf)
+    fix_out = buf.getvalue()
+finally:
+    builtins.input = _orig_input
+    os.environ.pop("PIPELINE_CONFIG_DIR", None)
+    os.environ.pop("DOCTOR_FEISHU_TOKEN_URL", None)
+    os.environ.pop("OPENCLAW_CONFIG_PATH", None)
+check("--fix 补全后 offline 复查 exit=0", code == 0, fix_out)
+check("--fix 输出引导标题", "交互引导" in fix_out)
+check("--fix 补全后对齐绿", "account_id 对齐" in fix_out)
+
+print("== 7) add-engineer.py（虚拟 team.json：新增+幂等+缺参报错） ==")
+import importlib.util  # noqa: E402
+_spec = importlib.util.spec_from_file_location(
+    "add_engineer", os.path.join(ROOT, "scripts", "add-engineer.py"))
+add_engineer = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(add_engineer)
+
+d6 = tempfile.mkdtemp(prefix="add-eng-")
+with open(os.path.join(d6, "team.json"), "w", encoding="utf-8") as f:
+    json.dump({"default_account": "bot01",
+               "accounts": {"bot01": {"engineer": "Alice",
+                                       "open_id": "ou_xxx1"}}}, f)
+os.makedirs(os.path.join(d6, "accounts"), exist_ok=True)
+with open(os.path.join(d6, "accounts", "bot01.json"), "w", encoding="utf-8") as f:
+    json.dump({"app_id": "cli_fakebot01000000", "app_secret": "s1"}, f)
+
+# 新增 bot03
+os.environ["PIPELINE_CONFIG_DIR"] = d6
+try:
+    argv = ["add-engineer.py", "bot03", "Carole"]
+    code = add_engineer.main(argv)
+    team_after = json.load(open(os.path.join(d6, "team.json"), encoding="utf-8"))
+    check("add-engineer 新增 exit=0", code == 0)
+    check("bot03 已登记", "bot03" in team_after["accounts"]
+          and team_after["accounts"]["bot03"]["engineer"] == "Carole")
+    check("bot03 凭证模板已建",
+          os.path.isfile(os.path.join(d6, "accounts", "bot03.json")))
+
+    # 幂等：重复添加同 id，open_id 保留、昵称覆盖
+    argv2 = ["add-engineer.py", "bot03", "Carole2"]
+    code2 = add_engineer.main(argv2)
+    team_after2 = json.load(open(os.path.join(d6, "team.json"), encoding="utf-8"))
+    check("add-engineer 幂等 exit=0", code2 == 0)
+    check("幂等覆盖昵称", team_after2["accounts"]["bot03"]["engineer"] == "Carole2")
+
+    # 缺参报错（exit=2）
+    code3 = add_engineer.main(["add-engineer.py"])
+    check("缺参 exit=2", code3 == 2)
+finally:
+    os.environ.pop("PIPELINE_CONFIG_DIR", None)
+
 print(f"\nDOCTOR TEST PASS: {PASS} checks")

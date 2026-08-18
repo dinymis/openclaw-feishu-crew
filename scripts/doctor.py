@@ -13,6 +13,7 @@
 用法：
     python3 scripts/doctor.py            # 全量检查（含飞书连通性探测）
     python3 scripts/doctor.py --offline  # 跳过连通性探测（无网环境）
+    python3 scripts/doctor.py --fix      # 交互引导：缺什么补填什么，填完自动复查
 
 退出码：全绿 0；存在 ❌ 时非 0（便于 CI / 脚本使用）。
 
@@ -297,6 +298,188 @@ def check_open_id_advice(team):
 
 
 # ---------------------------------------------------------------------------
+# --fix：交互引导补全
+# ---------------------------------------------------------------------------
+
+
+def _prompt(prompt, default=None):
+    """交互输入；异常（EOF/KeyboardInterrupt）时中断引导，不写坏配置。"""
+    suffix = f" [{default}]" if default else ""
+    try:
+        val = input(f"{prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit(0)
+    return val if val else (default or "")
+
+
+def _input_nonplaceholder(prompt, current=None):
+    """循环询问，直到用户输入非占位符值或直接回车跳过。"""
+    if current and not is_placeholder(str(current)):
+        cur = f"（当前已填：{current}）"
+    else:
+        cur = ""
+    while True:
+        val = _prompt(f"{prompt}{cur}", default="").strip()
+        if not val or not is_placeholder(val):
+            return val
+        print("  ↳ 这个值看起来还是占位符，请填真实值（回车跳过不修改）。")
+
+
+def fix_team_missing():
+    """team.json 不存在 → 复制 example 并结束（后续项交给下一轮）。"""
+    ex = team_config_path() + ".example"
+    if not os.path.isfile(ex):
+        print("  ↳ 未找到 team.json.example，无法自动生成，请手动创建 config/team.json。")
+        return
+    ans = _prompt("config/team.json 缺失，是否从 example 复制并继续？(y/N)", default="n").lower()
+    if ans in ("y", "yes"):
+        with open(ex, encoding="utf-8") as f:
+            content = f.read()
+        with open(team_config_path(), "w", encoding="utf-8") as f:
+            f.write(content)
+        print("  ✅ 已复制 team.json.example → team.json（占位值，继续填）")
+    else:
+        raise SystemExit(0)
+
+
+def _load_team_or_none():
+    if not os.path.isfile(team_config_path()):
+        return None
+    try:
+        return load_json(team_config_path())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_team(team):
+    with open(team_config_path(), "w", encoding="utf-8") as f:
+        json.dump(team, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def fix_team_fields(team):
+    """补 accounts 段工程师昵称 / open_id。"""
+    if not isinstance(team, dict):
+        return team
+    accounts = team.setdefault("accounts", {})
+    if not isinstance(accounts, dict):
+        return team
+    changed = False
+    for aid, info in list(accounts.items()):
+        if not isinstance(info, dict):
+            continue
+        # 昵称
+        if is_placeholder(info.get("engineer")):
+            v = _input_nonplaceholder(f"  accounts.{aid}.engineer（工程师昵称）")
+            if v:
+                info["engineer"] = v
+                changed = True
+        # open_id
+        oid = info.get("open_id")
+        if oid is None or oid == "" or is_placeholder(str(oid)) or not str(oid).startswith("ou_"):
+            v = _input_nonplaceholder(f"  accounts.{aid}.open_id（此 bot 下的 open_id，回车跳过）")
+            if v:
+                info["open_id"] = v
+                changed = True
+    if changed:
+        _save_team(team)
+        print("  ✅ team.json 已更新")
+    return team
+
+
+def fix_account_credentials(account_ids):
+    """补 config/accounts/<id>.json 的 app_id / app_secret。"""
+    if not account_ids:
+        return
+    os.makedirs(accounts_config_dir(), exist_ok=True)
+    for aid in account_ids:
+        path = os.path.join(accounts_config_dir(), f"{aid}.json")
+        data = {}
+        if os.path.isfile(path):
+            try:
+                data = load_json(path)
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        changed = False
+        app_id = data.get("app_id") or data.get("appId") or ""
+        app_secret = data.get("app_secret") or data.get("appSecret") or ""
+        if is_placeholder(app_id) or is_single_char_suffix(app_id):
+            v = _input_nonplaceholder(f"  accounts/{aid}.json app_id（cli_ 开头）")
+            if v:
+                data["app_id"] = v
+                data.pop("appId", None)
+                changed = True
+        if is_placeholder(app_secret):
+            v = _input_nonplaceholder(f"  accounts/{aid}.json app_secret")
+            if v:
+                data["app_secret"] = v
+                data.pop("appSecret", None)
+                changed = True
+        if changed:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            print(f"  ✅ accounts/{aid}.json 已更新")
+
+
+def fix_openclaw_accounts(team_account_ids, openclaw_path):
+    """openclaw.json 缺账号 → 提示补 channels.feishu.accounts 与 bindings（仅提示，不自动写）。"""
+    if not openclaw_path or not os.path.isfile(openclaw_path):
+        print(f"  ↳ 未找到 openclaw.json，请手动按 openclaw.example.json 补 channels.feishu.accounts "
+              f"与 bindings 中的 {', '.join(team_account_ids)}。")
+        return
+    try:
+        cfg = load_json(openclaw_path, allow_comments=True)
+        feishu = (cfg.get("channels") or {}).get("feishu") or {}
+        oc_accounts = set((feishu.get("accounts") or {}).keys())
+    except (json.JSONDecodeError, OSError, AttributeError):
+        print(f"  ↳ openclaw.json 解析失败，请手动对齐 channels.feishu.accounts。")
+        return
+    missing = sorted(set(team_account_ids) - oc_accounts)
+    if missing:
+        print("  ↳ openclaw.json 缺下列账号，请在 channels.feishu.accounts 与 bindings 手动补：")
+        for aid in missing:
+            print(f"      accounts: \"{aid}\": {{ \"appId\": ..., \"appSecret\": ... }}")
+            print(f"      bindings: {{ \"agentId\": \"coordinator\", "
+                  f"\"match\": {{ \"channel\": \"feishu\", \"accountId\": \"{aid}\" }} }}")
+
+
+def run_fix(out=sys.stdout):
+    """交互引导补全：逐项补填后自动复查。不改变非交互行为。"""
+    print("openclaw-feishu-crew doctor --fix 交互引导", file=out)
+    print("（缺什么补什么；提示里的 [回车跳过] 都可不填，直接回车保留现状。）", file=out)
+    print("-" * 60, file=out)
+
+    if not os.path.isfile(team_config_path()):
+        fix_team_missing()
+
+    team = _load_team_or_none()
+    if isinstance(team, dict):
+        account_ids = list((team.get("accounts") or {}).keys()) if isinstance(team.get("accounts"), dict) else []
+    else:
+        account_ids = []
+
+    if isinstance(team, dict):
+        team = fix_team_fields(team)
+        account_ids = list((team.get("accounts") or {}).keys()) if isinstance(team.get("accounts"), dict) else []
+
+    fix_account_credentials(account_ids)
+
+    oc_path = os.path.expanduser(os.environ.get("OPENCLAW_CONFIG_PATH")
+                                 or (team or {}).get("openclaw_config_path")
+                                 or "~/.openclaw/openclaw.json")
+    if account_ids:
+        fix_openclaw_accounts(account_ids, oc_path)
+
+    print()
+    print("补填完成，自动复查：", file=out)
+    print("-" * 60, file=out)
+    return run(offline=True, out=out)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -334,6 +517,8 @@ def run(offline=False, out=sys.stdout):
 
 def main():
     offline = "--offline" in sys.argv[1:]
+    if "--fix" in sys.argv[1:]:
+        sys.exit(run_fix())
     sys.exit(run(offline=offline))
 
 

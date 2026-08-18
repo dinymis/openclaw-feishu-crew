@@ -4,9 +4,9 @@
 
 ## 可以贡献什么
 
-- 通用机制改进：`scripts/pipeline.py` 状态机/命令、`scripts/resolve-project.py`
-- 配置模板与文档：`config/*.example`、README、快速上手步骤
-- 测试：`tests/smoke_test.py` 覆盖新场景
+- 通用机制改进：`scripts/pipeline.py` 状态机/命令、`scripts/resolve-project.py`、`scripts/doctor.py`、`scripts/add-engineer.py`
+- 配置模板与文档：`config/*.example`、README、INDEX.md、SETUP_WIZARD.md、`docs/feishu-app-setup.md`
+- 测试：`tests/smoke_test.py`、`tests/doctor_test.py` 覆盖新场景
 - Bug 报告与使用问题：直接开 issue
 
 ## 开发约定

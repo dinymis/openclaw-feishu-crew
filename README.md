@@ -2,6 +2,9 @@
 
 > **在飞书里用多个 bot 账号模拟一支工程师团队，按任务看板协作干活。**
 
+> 🪄 **试试对你的 OpenClaw 说：「读 INDEX.md，带我部署一支三人团队」。**
+> 它会照着 [INDEX.md](INDEX.md) 导航 + [SETUP_WIZARD.md](SETUP_WIZARD.md) 的 checklist 一步步带你建应用、填配置、跑绿 doctor、验证看板。
+
 每个飞书 bot 账号是一位「工程师」，各带一块独立的任务看板；需求猴 / 架构猴 / 编码猴 / 质检猴 / 测试猴五只角色猴按流水线接单干活。这是 [OpenClaw](https://github.com/openclaw/openclaw) 生态内的「多 Agent 团队协作」工作区模板 + 编排脚本包。
 
 ## 它解决什么问题
@@ -87,21 +90,28 @@ python3 scripts/resolve-project.py <项目别名> [服务别名]
 ```
 openclaw-feishu-crew/
 ├── README.md
+├── INDEX.md                   # AI 导航：文件地图 + 部署/排错/加人入口
+├── SETUP_WIZARD.md            # 写给 AI 执行的逐步部署 checklist
 ├── LICENSE                    # MIT
 ├── .gitignore                 # 真实凭证/看板状态不入库
+├── openclaw.example.json      # OpenClaw 多 agent + 多账号配置模板
 ├── scripts/
 │   ├── pipeline.py            # 核心：看板状态机 + 命令层（配置分层版）
-│   ├── doctor.py              # 一键自检：配置完整性/对齐/凭证连通性
+│   ├── doctor.py              # 一键自检（含 --fix 交互补全）
+│   ├── add-engineer.py        # 一键新增工程师（三处同步 + doctor 复查）
 │   └── resolve-project.py     # 项目别名 → 任务前导语
 ├── config/
 │   ├── README.md              # 配置层说明与优先级
 │   ├── team.json.example      # 团队配置模板（虚构示例）
 │   └── accounts/
 │       └── bot01.json.example # per-account 飞书凭证模板
+├── docs/
+│   ├── architecture.md        # 整体架构与状态机说明
+│   └── feishu-app-setup.md    # 飞书自建应用搭建 SOP
 ├── projects.example.json      # 项目登记模板（虚构 demo-shop）
 └── tests/
     ├── smoke_test.py          # 离线冒烟：状态机闭环验收
-    └── doctor_test.py         # doctor 自测：全绿/缺配置两条路径
+    └── doctor_test.py         # doctor / add-engineer / --fix 自测
 ```
 
 ## 安全与边界
