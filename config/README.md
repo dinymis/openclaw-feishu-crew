@@ -11,6 +11,8 @@
 
 ## 第三方如何填写
 
+最快方式：`python3 scripts/setup.py` —— 自动从 `*.example` 生成下面的配置文件骨架，交互问答收集昵称 / app_id / app_secret / open_id，幂等（已存在的配置保留不覆盖）。以下为手动方式，字段含义相同：
+
 1. 复制 `team.json.example` 为 `team.json`：
    - `accounts` 段的 key（如 `bot01`）是你的 bot 账号 id，一个 key 对应一位「工程师」；
    - `engineer` 填工程师昵称（任意名字，如 Alice）；

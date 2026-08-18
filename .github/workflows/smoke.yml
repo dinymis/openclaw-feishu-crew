@@ -1,4 +1,4 @@
-# 冒烟验收：离线跑通看板状态机闭环（board / assign / set-result / complete）
+# 冒烟验收：离线跑通看板状态机闭环（board / assign / set-result / complete）+ doctor/setup 自测
 # 失败即 CI 红。脚本零第三方依赖，见 CONTRIBUTING.md。
 name: smoke
 
@@ -29,3 +29,6 @@ jobs:
 
       - name: 运行 doctor 自检自测
         run: python3 tests/doctor_test.py
+
+      - name: 运行 setup 一键初始化自测
+        run: python3 tests/setup_test.py

@@ -2,6 +2,10 @@
 
 > **写给 AI 执行的逐步部署 checklist。** 目标：让第三方从 clone 到「看板出卡片」一路可验证。
 > 每步都附**确定性验证命令**，AI 照做即可；做完一条勾一条。
+>
+> 💡 阶段 1/3 的手动拷模板与填配置可用 `python3 scripts/setup.py` 一条命令代替
+> （自动从 `*.example` 生成配置骨架 + 交互问答收集昵称/appId/appSecret/open_id + doctor 自检）；
+> 非交互/CI：`python3 scripts/setup.py --account-id bot01 --name Alice --app-id cli_xxx --app-secret *** --open-id ou_xxx`。
 
 ---
 
@@ -23,6 +27,10 @@
 - 预期：报 `config/team.json 不存在`、`channels.feishu.accounts` 缺失等 ❌。这是正常的起点快照，记下缺了什么。
 
 ### 阶段 1：准备配置文件
+
+> 快捷路径：`python3 scripts/setup.py`（交互问答收集一位工程师的昵称/appId/appSecret/open_id，
+> 自动生成 team.json 与 accounts/<account_id>.json 骨架，幂等不覆盖已有配置）。
+> 以下为手动等价步骤，多人团队逐个加人时也可改用阶段 7 的 `add-engineer.py`。
 
 - [ ] 复制团队模板：`cp config/team.json.example config/team.json`
 - [ ] 复制凭证模板（先给 bot01）：
@@ -70,6 +78,7 @@
 
 - [ ] `python3 tests/smoke_test.py` → 输出 `SMOKE PASS`
 - [ ] `python3 tests/doctor_test.py` → 输出 `DOCTOR TEST PASS`
+- [ ] `python3 tests/setup_test.py` → 输出 `SETUP TEST PASS`
 
 ### 阶段 7：加人（可选，用脚本而非手改）
 
@@ -83,6 +92,6 @@
 - [ ] `doctor.py`（联网）全绿
 - [ ] `openclaw gateway restart` 无报错
 - [ ] 对 bot 说「看板」能收到卡片
-- [ ] 两组测试全绿
+- [ ] 三组测试全绿（smoke / doctor / setup）
 
 以上全勾 = 团队可用。若中途卡住，把 `python3 scripts/doctor.py` 的输出发给用户，按 ❌ 与 FAQ 逐条解。

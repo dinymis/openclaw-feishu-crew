@@ -24,13 +24,37 @@ OpenClaw 单 agent 会话是「一个全能助理」；本项目把它变成「�
 | [OpenClaw](https://github.com/openclaw/openclaw) | 提供多 agent 配置（`agents.list`）、`sessions_spawn(agentId)` 子会话、飞书 channel 多账号（`channels.feishu.accounts`） |
 | 飞书自建应用 × N | 每个工程师一个 bot 应用，需要开通机器人消息收发与卡片交互权限 |
 
-## 快速上手（五步）
+## 快速上手（三步）
 
-1. **建飞书应用**：在飞书开放平台为每位工程师创建一个自建应用（bot），记下每个应用的 `app_id` / `app_secret`；
-2. **配 OpenClaw 多账号**：复制 `openclaw.example.json` 为你的 OpenClaw 配置（或并入现有配置），在 `channels.feishu.accounts.<account_id>` 填入各应用凭证——模板里已标注 `agents.list`、两处白名单（`subagents.allowAgents` / `tools.agentToAgent.allow`，最易踩的坑）与 `bindings` 的填法；
-3. **部署本仓库**：把本仓库拷入 coordinator 工作区（`scripts/` + `config/` + `projects.json`）；
-4. **填配置**：按 `config/README.md` 复制 `*.example` 为真实配置文件并填入凭证 / open_id / 工程师昵称；
-5. **自检**：`python3 scripts/doctor.py`——全绿后 `openclaw gateway restart`，对任一 bot 说「看板」即可看到第一张卡片。
+1. **建飞书应用**：在飞书开放平台为每位工程师创建一个自建应用（bot），记下每个应用的 `app_id` / `app_secret`（图文 SOP 见 [docs/feishu-app-setup.md](docs/feishu-app-setup.md)）；
+2. **一键初始化**：
+
+```bash
+git clone https://github.com/dinymis/openclaw-feishu-crew
+cd openclaw-feishu-crew && python3 scripts/setup.py
+openclaw gateway restart   # 然后对 bot 说「看板」
+```
+
+`setup.py` 会自动从 `*.example` 生成配置骨架（`config/team.json`、`config/accounts/<account_id>.json`，已存在的保留不覆盖），交互问答收集昵称 / `app_id` / `app_secret` / `open_id`，并收尾跑 doctor 自检、列出待补项。
+
+<details>
+<summary><b>高级：分步手动配置（setup.py 做的事拆开看）</b></summary>
+
+1. **配 OpenClaw 多账号**：复制 `openclaw.example.json` 为你的 OpenClaw 配置（或并入现有配置），在 `channels.feishu.accounts.<account_id>` 填入各应用凭证——模板里已标注 `agents.list`、两处白名单（`subagents.allowAgents` / `tools.agentToAgent.allow`，最易踩的坑）与 `bindings` 的填法；
+2. **部署本仓库**：把本仓库拷入 coordinator 工作区（`scripts/` + `config/` + `projects.json`）；
+3. **填配置**：按 `config/README.md` 复制 `*.example` 为真实配置文件并填入凭证 / open_id / 工程师昵称；
+4. **自检**：`python3 scripts/doctor.py`——全绿后 `openclaw gateway restart`，对任一 bot 说「看板」即可看到第一张卡片。
+
+非交互/CI 场景也可一条命令直接生成完整配置：
+
+```bash
+python3 scripts/setup.py --account-id bot01 --name Alice \
+  --app-id cli_xxx --app-secret secret-xxx --open-id ou_xxx
+python3 scripts/setup.py --apply      # 可选：把账号自动并入 openclaw.json（合并前先备份 .bak）
+python3 scripts/setup.py --offline    # 可选：跳过 doctor 联网探测
+```
+
+</details>
 
 ## 配置说明
 
@@ -42,6 +66,11 @@ OpenClaw 单 agent 会话是「一个全能助理」；本项目把它变成「�
 ## 命令速查
 
 ```bash
+# 一键初始化（clone 后第一条命令；幂等，已存在的配置保留不覆盖）
+python3 scripts/setup.py              # 交互问答：昵称/appId/appSecret/open_id
+python3 scripts/setup.py --apply      # 同上，并把账号自动并入 openclaw.json（先备份 .bak）
+python3 scripts/setup.py --offline    # 同上，跳过 doctor 联网探测
+
 # 一键自检（填完两份配置后先跑这个，全绿再 restart）
 python3 scripts/doctor.py            # 全量检查（含飞书凭证连通性探测）
 python3 scripts/doctor.py --offline  # 无网环境：跳过连通性探测
@@ -77,7 +106,7 @@ python3 scripts/resolve-project.py <项目别名> [服务别名]
 
 ## 冒烟验收边界
 
-- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；
+- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；`tests/setup_test.py` 验证 setup.py 骨架生成 / 幂等 / `--apply` 备份（均为临时目录虚构配置，不碰仓库 config/）；
 - 真实飞书卡片收发需要有效应用凭证与 open_id：未配置凭证时 `board` 等涉及卡片的命令会在发送阶段报错，属预期行为——请先按「快速上手」配置。
 
 ## 常见问题 FAQ
@@ -104,6 +133,7 @@ openclaw-feishu-crew/
 ├── .gitignore                 # 真实凭证/看板状态不入库
 ├── openclaw.example.json      # OpenClaw 多 agent + 多账号配置模板
 ├── scripts/
+│   ├── setup.py               # 一键初始化（生成配置骨架 + doctor 自检，幂等）
 │   ├── pipeline.py            # 核心：看板状态机 + 命令层（配置分层版）
 │   ├── doctor.py              # 一键自检（含 --fix 交互补全）
 │   ├── add-engineer.py        # 一键新增工程师（三处同步 + doctor 复查）
@@ -119,7 +149,8 @@ openclaw-feishu-crew/
 ├── projects.example.json      # 项目登记模板（虚构 demo-shop）
 └── tests/
     ├── smoke_test.py          # 离线冒烟：状态机闭环验收
-    └── doctor_test.py         # doctor / add-engineer / --fix 自测
+    ├── doctor_test.py         # doctor / add-engineer / --fix 自测
+    └── setup_test.py          # setup.py 一键初始化自测（骨架/幂等/--apply 备份）
 ```
 
 ## 安全与边界
