@@ -130,6 +130,7 @@ check(wm.STATUS_MAP["review"] == "review", "review -> review")
 check(wm.STATUS_MAP["done"] == "done", "done -> done")
 check(wm.STATUS_MAP["stopped"] == "blocked", "stopped -> blocked")
 check(wm.STATUS_MAP["error"] == "blocked", "error -> blocked")
+check(wm.STATUS_MAP["waiting_retry"] == "blocked", "waiting_retry -> blocked")
 check(wm.ALLOWED_WB_STATUS == {"todo", "running", "review", "blocked", "done"},
       "镜像卡只允许五态（R1/R4）")
 

@@ -74,7 +74,7 @@ This folder is home. Treat it that way.
    ```
 
 4. **成功**：`set-result <task_id> "<完整结果>" "<摘要>"` 保存结果（任务转 `review`），再视任务性质 `complete`（临时/连通性任务直接完成）或停在 `review` 等用户审核；
-5. **失败**：执行 `fail <task_id> "<错误摘要>"`；若返回 `retry: true`，用返回的 `agent_id` 再次 `sessions_spawn` 并 `record-run` 记录新一轮运行。
+5. **失败**：执行 `fail <task_id> "<错误摘要>"`；瞬时错误（配额/限流/429/超时/5xx）会自动进 `waiting_retry` 退避（attempts 不增，返回 `waiting: true`），由 cron 驱动的 `retry-due` 到点拉起；非瞬时错误（权限/配置）直接转 `error` 终态。
 
 > ⚠️ 每只猴都必须显式传 `agentId`（尤其 `architect` 这类有独立模型配置的猴），否则会继承当前会话默认模型而非配置的专属模型。
 
@@ -82,16 +82,22 @@ This folder is home. Treat it that way.
 
 看板层维护任务级重试；OpenClaw 自身的 provider/http 重试**不等于**看板任务重试。
 
-- **`fail`**：瞬时错误（限流/超时/5xx/配额）。任务保持在看板上（内部经 `pending` 重新分配），`attempts` 递增；返回 `retry: true` 时由**协调猴**负责重新 `sessions_spawn` 同一 `agentId`，禁止绕过看板直接重试（否则次数和状态会不准）；
-- **不存在独立的 `waiting_retry` 中间态**：`fail` 返回 `retry=true` 后重试由编排方（协调猴）驱动；
-- **`error`**：权限/配置类错误，**不可重试**，任务直接进 `error` 终态，向用户说明原因；
-- 重试耗尽（默认 `max_attempts=3`，可在 `team.json` 配置）后任务转 `error` 终态，需人工介入。
+- **`fail`** 自动分类：
+  - **瞬时错误**（配额/限流/429/超时/5xx 等关键词）→ 任务转 `waiting_retry` 状态并记 `next_retry_at`（默认退避 1800s，team.json `retry_backoff_seconds` 可配），**attempts 不增**，返回 `waiting: true`，此时**不要**立即 spawn；
+  - **非瞬时错误**（权限/配置类）→ 任务直接转 `error` 终态不重试，向用户说明原因（与 `error` 命令路径一致）；
+  - 瞬时错误但 attempts 已达 `max_attempts`（默认 3，team.json 可配）→ 转 `error` 终态，需人工介入。
+- **`retry-due`（退避到期扫描）**：cron 定期驱动，把到点的 `waiting_retry` 任务真启动（attempts 此时才 +1），返回 `started` 列表；协调猴对每个条目 `sessions_spawn(agentId=<agent_id>)` 拉起并 `record-run`。禁止绕过看板直接重试（否则次数和状态会不准）。
 
 失败处理流程：
 
 1. `BOARD_ACCOUNT=<account_id> python3 scripts/pipeline.py fail <task_id> "<错误摘要>"`；
-2. 返回 `retry: true` → 读取 `agent_id`，`sessions_spawn(agentId=<agent_id>, ...)` 重新拉起 → `record-run` 记录；
-3. 返回 `retry: false` → 任务已进 `error`，向用户说明重试耗尽与最后错误。
+2. 返回 `waiting: true` → 任务已进退避，等 `retry-due` 到点拉起（见下）；
+3. 返回 `waiting: false` → 任务已进 `error`（非瞬时错误或重试耗尽），向用户说明原因与最后错误。
+
+退避到期拉起流程（`retry-due` 返回 `started` 非空时）：
+
+1. 对 `started` 每个条目：`sessions_spawn(agentId=<agent_id>, ...)` 重新拉起；
+2. `record-run <task_id> <run_id> <child_session_key>` 记录新一轮。
 
 ### 流水线模式（手动审核）
 

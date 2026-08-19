@@ -49,21 +49,37 @@
 
 | 命令 | 说明 |
 |---|---|
-| `fail <task_id> <错误摘要>` | **瞬时错误**（限流/超时/5xx/配额）。`attempts` 递增：未达 `max_attempts`（默认 3，team.json 可配）时任务重新分配继续 `running`，返回 `retry: true` + `agent_id`，由协调猴重新拉起；耗尽则转 `error`，返回 `retry: false` |
+| `fail <task_id> <错误摘要>` | 失败上报，自动分类：**瞬时错误**（配额/限流/429/超时/5xx 等关键词命中）→ 任务转 `waiting_retry` 状态并记 `next_retry_at`（默认退避 1800s，team.json `retry_backoff_seconds` 可配），**attempts 不增**，返回 `waiting: true`；**非瞬时错误**（权限/配置类）→ 直接转 `error` 终态不重试；瞬时错误且 attempts 已达 `max_attempts` → 转 `error` |
 | `error <task_id> <错误摘要>` | **不可重试错误**（权限/配置类），任务直接转 `error` 终态，返回 `retry: false` |
+| `retry-due` | **退避到期扫描（sweep，幂等）**：把 `next_retry_at` 已到点的 `waiting_retry` 任务转回并真启动（`running`），**attempts 此时才 +1**（账实相符：账上 +1 = 真启动一次）。返回 `started` 列表（含 task_id/agent_id），由协调猴对每个条目 `sessions_spawn(agentId=<agent_id>)` 拉起并 `record-run`。建议由 cron 每分钟驱动（见下方「退避重试驱动」） |
 
-> ⚠️ 没有独立的 `retry` / `waiting_retry` 命令或状态：重试完全由 `fail` 的返回值驱动，编排方（协调猴）收到 `retry: true` 后用 `sessions_spawn(agentId=<agent_id>)` 重新拉起同一任务并 `record-run` 记录。禁止绕过看板直接重试，否则次数与状态失真。
+> ⚠️ 重试完全由看板状态机驱动：`fail` 瞬时失败不再立即重试（不烧 attempts），而是进 `waiting_retry` 等退避到期；禁止绕过看板直接重试，否则次数与状态失真。
+
+#### 退避重试驱动（cron）
+
+`waiting_retry` 任务的到期启动由外部 cron 定期调用 `retry-due` 驱动（脚本自身不内置定时器），建议每分钟一次、逐账号扫（命令幂等，无到点任务时不写状态、不发卡片）：
+
+```cron
+* * * * * for a in bot01 bot02; do BOARD_ACCOUNT=$a python3 /path/to/scripts/pipeline.py retry-due >/dev/null 2>&1; done
+```
+
+> `started` 非空时，协调猴需在心跳/下次巡检时对列出的任务补 `sessions_spawn` + `record-run`（看板已把任务置为 `running` 并 attempts+1）。
 
 ## 状态机速览
 
 ```
 assign/start → pending → running → review → done
-                           │  ↑ fail（attempts<max，重新分配）
+                           │  ↓ fail（瞬时错误，attempts 不增）
+                           │  waiting_retry（带 next_retry_at 退避）
+                           │  ↓ retry-due 到点真启动（attempts 才 +1）
+                           ├─→ running（回到运行）…… attempts 耗尽再 fail → error
                            ├─→ stopped（stop）
-                           ├─→ error（error，或 fail 重试耗尽）
+                           ├─→ error（error / fail 非瞬时错误 / 重试耗尽）
 review → running（审核打回重派）
 done/error/stopped → clear（归档进 history）
 ```
+
+**并发写保护（revision 乐观锁）**：state.json 带 `revision` 字段，每次写入 +1；命令保存时若磁盘 revision 已超前（并发写抢先），本次写入被拒并自动重读重试（最多 10 次），不会互相覆盖。
 
 ## 典型工作流
 
@@ -97,10 +113,13 @@ python3 scripts/pipeline.py clear task-1787100000-a1b2c3
 失败分支（替换步骤 4）：
 
 ```bash
-# 瞬时错误（如超时）：fail 返回 retry=true 时协调猴重新 spawn 同一 agent_id
+# 瞬时错误（如超时/配额/429）：fail 自动进 waiting_retry 退避，attempts 不增
 python3 scripts/pipeline.py fail task-1787100000-a1b2c3 "子会话超时"
-# → {"ok": true, "retry": true, "agent_id": "coder", "attempts": 2, "max_attempts": 3, ...}
-# 协调猴：sessions_spawn(agentId="coder", ...) → record-run 记录新一轮
+# → {"ok": true, "retry": false, "waiting": true,
+#    "next_retry_at": "2026-08-19 15:30:00", ...}
+# 协调猴此时不 spawn；cron 驱动的 retry-due 到点拉起（见「退避重试驱动」）：
+# → {"ok": true, "started": [{"task_id": ..., "agent_id": "coder", "attempts": 2, ...}]}
+# 协调猴对 started 每项：sessions_spawn(agentId="coder", ...) → record-run
 
 # 权限/配置类错误：不重试，直接终态
 python3 scripts/pipeline.py error task-1787100000-a1b2c3 "飞书应用缺少卡片权限"

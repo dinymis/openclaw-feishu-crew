@@ -5,8 +5,9 @@ Supports both full pipeline tasks (4 stages) and ad-hoc assignments
 to individual agents. Each agent can hold one task at a time.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
+import fcntl
 import json
 import os
 import sys
@@ -15,11 +16,30 @@ import uuid
 import subprocess
 import urllib.request
 import urllib.error
+from contextlib import contextmanager
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.dirname(SCRIPT_DIR)
 FEISHU_API = "https://open.feishu.cn/open-apis"
 DEFAULT_MAX_ATTEMPTS = 3
+
+# --- O1 revision 乐观锁参数 -----------------------------------------------
+# 并发写冲突时最多重读重试次数（每次重试 = 重新 load + 重放本次修改）。
+REVISION_MAX_RETRIES = 10
+
+# --- O2 退避重试参数 ------------------------------------------------------
+# 瞬时错误失败后进入 waiting_retry 状态的默认退避时长（秒），
+# 可由 team.json 的 retry_backoff_seconds 覆盖。
+DEFAULT_RETRY_BACKOFF_SECONDS = 1800
+
+# O2：瞬时错误关键词（fail 命令自动检测，命中 → waiting_retry 退避，
+# 不烧 attempts；未命中视为权限/配置类错误 → error 终态不重试）。
+TRANSIENT_ERROR_KEYWORDS = (
+    "quota", "配额", "rate limit", "rate_limit", "ratelimit", "限流",
+    "429", "timeout", "timed out", "超时", "5xx", "500", "502", "503", "504",
+    "temporarily unavailable", "暂时不可用", "connection reset",
+    "overloaded", "server busy", "服务繁忙", "网络", "network",
+)
 
 # --- 配置分层（方案 B：单代码库 + 配置分层，v2.0.0） --------------------
 # 代码中不再内嵌业务敏感值（飞书凭证/open_id/工程师真名/私有模型名），
@@ -156,6 +176,7 @@ STATUS_ICON = {
     "stopped": "🛑",
     "error": "❌",
     "idle": "⏸",
+    "waiting_retry": "⏰",
 }
 
 STATUS_LABEL = {
@@ -166,6 +187,7 @@ STATUS_LABEL = {
     "stopped": "已停止",
     "error": "失败",
     "idle": "空闲",
+    "waiting_retry": "等待重试",
 }
 
 
@@ -241,6 +263,7 @@ def load_state():
 def make_fresh_state():
     return {
         "version": 2,
+        "revision": 0,
         "account": CURRENT_ACCOUNT,
         "engineer": engineer_name(),
         "agents": {aid: {"status": "idle", "current_tasks": []} for aid in AGENTS},
@@ -256,6 +279,7 @@ def normalize_task(task):
     task.setdefault("last_error", "")
     task.setdefault("run_id", "")
     task.setdefault("child_session_key", "")
+    task.setdefault("next_retry_at", None)
     return task
 
 
@@ -278,6 +302,8 @@ def normalize_agent_state(state):
 
 def normalize_state(state):
     state.setdefault("version", 2)
+    # O1：存量 state 文件（无 revision 字段）平滑升级，首次写入后 revision=1。
+    state.setdefault("revision", 0)
     state.setdefault("account", CURRENT_ACCOUNT)
     state.setdefault("engineer", engineer_name())
     state.setdefault("agents", {})
@@ -350,8 +376,65 @@ def migrate_state(old):
 
 
 def save_state(state):
-    with open(state_file(), "w") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    """O1 revision 乐观锁写入：
+
+    写前比较磁盘 revision 与本次读取时的期望值（state["revision"]），
+    一致才写入并 +1；不一致（并发写已抢先）抛 RevisionConflictError，
+    由调用方的 revision_retry 重读重试。全程持文件锁，避免
+    「读-比-写」竞态。旧文件无 revision 字段视为 0，兼容存量升级。
+    """
+    path = state_file()
+    with _state_file_lock():
+        disk_revision = 0
+        try:
+            with open(path) as f:
+                disk_revision = int(json.load(f).get("revision") or 0)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            disk_revision = 0
+        expected = int(state.get("revision") or 0)
+        if disk_revision != expected:
+            raise RevisionConflictError(
+                f"state revision conflict: disk={disk_revision} expected={expected}")
+        state["revision"] = expected + 1
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+
+
+class RevisionConflictError(Exception):
+    """O1：并发写冲突（磁盘 revision 已超前于本次读取的期望值）。"""
+
+
+@contextmanager
+def _state_file_lock():
+    """state 文件互斥锁（纯标准库 fcntl），保证 revision 检查+写入原子。"""
+    lock_path = state_file() + ".lock"
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def revision_retry(func):
+    """O1：命令级重试装饰器。
+
+    被装饰函数每次执行都会重新 load_state，因此保存冲突时直接
+    重放整个命令（重读最新状态 + 重新应用修改），最多
+    REVISION_MAX_RETRIES 次。
+    """
+    def wrapper(*args, **kwargs):
+        for attempt in range(REVISION_MAX_RETRIES):
+            try:
+                return func(*args, **kwargs)
+            except RevisionConflictError:
+                if attempt == REVISION_MAX_RETRIES - 1:
+                    raise
+                continue
+        raise RevisionConflictError("unreachable")
+    return wrapper
 
 
 # --- Workboard 镜像层（1 档，单向只读镜像，可选功能） -----------------
@@ -510,6 +593,7 @@ def start_task_assignment(state, task_id):
     return True, None
 
 
+@revision_retry
 def add_adhoc_task(agent_id, title):
     state = load_state()
     task_id, err = create_task(state, title, agent_id)
@@ -527,6 +611,7 @@ def add_adhoc_task(agent_id, title):
     return {"ok": True, "msg": f"已分配给 {AGENTS[agent_id]['name']}", "task_id": task_id}
 
 
+@revision_retry
 def start_pipeline(title):
     state = load_state()
     parent_id = new_task_id()
@@ -555,6 +640,7 @@ def start_pipeline(title):
     return {"ok": True, "msg": f"流水线启动：{title}", "parent_id": parent_id}
 
 
+@revision_retry
 def complete_task(task_id):
     state = load_state()
     task = state["tasks"].get(task_id)
@@ -590,6 +676,7 @@ def complete_task(task_id):
     return {"ok": True, "msg": f"任务完成：{task['title']}"}
 
 
+@revision_retry
 def review_task(task_id):
     state = load_state()
     task = state["tasks"].get(task_id)
@@ -604,6 +691,7 @@ def review_task(task_id):
     return {"ok": True, "msg": f"已提交审核：{task['title']}"}
 
 
+@revision_retry
 def stop_task(task_id):
     state = load_state()
     task = state["tasks"].get(task_id)
@@ -621,6 +709,7 @@ def stop_task(task_id):
     return {"ok": True, "msg": f"已停止：{task['title']}"}
 
 
+@revision_retry
 def set_task_result(task_id, result_text, summary=None):
     state = load_state()
     task = state["tasks"].get(task_id)
@@ -636,6 +725,7 @@ def set_task_result(task_id, result_text, summary=None):
     return {"ok": True, "msg": f"结果已保存：{task['title']}"}
 
 
+@revision_retry
 def record_task_run(task_id, run_id=None, child_session_key=None):
     state = load_state()
     task = state["tasks"].get(task_id)
@@ -651,12 +741,35 @@ def record_task_run(task_id, run_id=None, child_session_key=None):
     return {"ok": True, "msg": f"运行信息已记录：{task['title']}"}
 
 
-def fail_task(task_id, error_text):
-    """Mark a task failure and retry it when attempts remain.
+def retry_backoff_seconds():
+    """O2：瞬时错误退避时长（秒），team.json retry_backoff_seconds 可配，默认 1800。"""
+    return int(TEAM.get("retry_backoff_seconds") or DEFAULT_RETRY_BACKOFF_SECONDS)
 
-    This is task-level retry bookkeeping for the board. The actual
-    OpenClaw agent turn must be launched by the coordinator with
-    sessions_spawn(agentId=<task.agent>) after this command returns retry=true.
+
+def is_transient_error(error_text):
+    """O2：判断错误是否为瞬时错误（配额/限流/超时/5xx 等）。
+
+    命中 TRANSIENT_ERROR_KEYWORDS 任一关键词即视为瞬时错误，
+    适合退避后重试；否则视为权限/配置类错误，重试无益。
+    """
+    text = (error_text or "").lower()
+    return any(kw.lower() in text for kw in TRANSIENT_ERROR_KEYWORDS)
+
+
+@revision_retry
+def fail_task(task_id, error_text):
+    """Mark a task failure; transient errors back off instead of burning attempts.
+
+    O2 重试纪律（2026-08-13 定，2026-08-19 落地）：
+    - 瞬时错误（配额/限流/429/超时/5xx 等）→ 任务转 waiting_retry 状态，
+      记 next_retry_at（默认退避 1800s），attempts 不增；到点后由
+      retry-due 扫描转回并真启动，此时 attempts 才 +1。
+    - 非瞬时错误（权限/配置类）→ 直接转 error 终态，不可重试，
+      与 error 命令路径一致。
+
+    返回体兼容旧字段 retry/agent_id：waiting_retry 时 retry=false、
+    waiting=true，由 retry-due（cron 驱动）到点拉起，协调猴无需
+    在 fail 返回后立即 spawn。
     """
     state = load_state()
     task = state["tasks"].get(task_id)
@@ -669,40 +782,65 @@ def fail_task(task_id, error_text):
 
     attempts = int(task.get("attempts") or 0)
     max_attempts = int(task.get("max_attempts") or default_max_attempts())
-    if attempts < max_attempts:
-        task["status"] = "pending"
-        task["summary"] = f"上次失败，准备自动重试 {attempts + 1}/{max_attempts}：{error_text[:80]}"
-        task["completed_at"] = None
-        ok, err = start_task_assignment(state, task_id)
-        save_state(state)
-        # fail 重试期：卡片保持 running，仅追加重试 comment（见设计文档边界）
-        _trigger_workboard_mirror(
-            [task_id],
-            comment=f"第 {task['attempts']}/{max_attempts} 次重试：{error_text[:80]}",
-        )
-        update_board(state)
-        if ok:
-            return {
-                "ok": True,
-                "retry": True,
-                "msg": f"任务失败，已触发重试 {task['attempts']}/{max_attempts}：{task['title']}",
-                "task_id": task_id,
-                "agent_id": agent_id,
-                "attempts": task["attempts"],
-                "max_attempts": max_attempts,
-            }
-        return {"ok": False, "retry": False, "msg": f"重试启动失败：{err}"}
 
-    task["status"] = "error"
-    task["completed_at"] = now()
-    task["summary"] = f"重试耗尽 {attempts}/{max_attempts}：{error_text[:120]}"
+    # 非瞬时错误：权限/配置类，重试无益，直接 error 终态
+    if not is_transient_error(error_text):
+        task["status"] = "error"
+        task["completed_at"] = now()
+        task["summary"] = f"不可重试（权限/配置类）：{error_text[:120]}"
+        save_state(state)
+        _trigger_workboard_mirror([task_id])
+        update_board(state)
+        return {
+            "ok": True,
+            "retry": False,
+            "waiting": False,
+            "msg": f"任务失败（非瞬时错误，不重试）：{task['title']}",
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+        }
+
+    # 瞬时错误但重试额度已耗尽 → error 终态
+    if attempts >= max_attempts:
+        task["status"] = "error"
+        task["completed_at"] = now()
+        task["summary"] = f"重试耗尽 {attempts}/{max_attempts}：{error_text[:120]}"
+        save_state(state)
+        _trigger_workboard_mirror([task_id])
+        update_board(state)
+        return {
+            "ok": True,
+            "retry": False,
+            "waiting": False,
+            "msg": f"任务失败且重试耗尽：{task['title']}",
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+        }
+
+    # 瞬时错误且有重试额度 → waiting_retry + 退避，attempts 不增
+    backoff = retry_backoff_seconds()
+    next_retry_ts = time.time() + backoff
+    task["status"] = "waiting_retry"
+    task["next_retry_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_retry_ts))
+    task["completed_at"] = None
+    task["summary"] = (f"瞬时失败退避中（attempts 不增），预计重试 "
+                       f"{task['next_retry_at']}：{error_text[:80]}")
     save_state(state)
-    _trigger_workboard_mirror([task_id])
+    _trigger_workboard_mirror(
+        [task_id],
+        comment=f"瞬时失败，退避至 {task['next_retry_at']}：{error_text[:80]}",
+    )
     update_board(state)
     return {
         "ok": True,
         "retry": False,
-        "msg": f"任务失败且重试耗尽：{task['title']}",
+        "waiting": True,
+        "next_retry_at": task["next_retry_at"],
+        "msg": f"任务瞬时失败，已转等待重试（预计 {task['next_retry_at']}）：{task['title']}",
         "task_id": task_id,
         "agent_id": agent_id,
         "attempts": attempts,
@@ -710,6 +848,52 @@ def fail_task(task_id, error_text):
     }
 
 
+@revision_retry
+def retry_due_tasks():
+    """O2：扫描到点的 waiting_retry 任务并真启动（sweep，幂等）。
+
+    驱动端由 cron 定期调用（如每分钟）。仅当 next_retry_at <= 当前时间
+    时启动：任务转 running，attempts 此时才 +1（账实相符：账上 +1
+    即代表真启动了一次）。返回本次启动的任务列表，由协调猴/调用方
+    负责 sessions_spawn 拉起子会话。幂等：未到点/无 waiting 任务时
+    返回空列表，不写状态。
+    """
+    state = load_state()
+    now_str = now()
+    due = [t for t in state["tasks"].values()
+           if t.get("status") == "waiting_retry"
+           and (t.get("next_retry_at") or "") <= now_str]
+    if not due:
+        return {"ok": True, "started": [], "msg": "无到点重试任务"}
+
+    started = []
+    for task in sorted(due, key=lambda x: x.get("next_retry_at") or ""):
+        task["next_retry_at"] = None
+        task["status"] = "pending"  # 回归可分配态，再由 start_task_assignment 真启动
+        ok, err = start_task_assignment(state, task["id"])
+        if ok:
+            started.append({
+                "task_id": task["id"],
+                "agent_id": task["agent"],
+                "attempts": task["attempts"],
+                "max_attempts": int(task.get("max_attempts") or default_max_attempts()),
+            })
+        else:
+            # 启动失败（理论上不应发生）：回退等待下个周期再扫
+            task["status"] = "waiting_retry"
+            task["next_retry_at"] = now_str
+    save_state(state)
+    _trigger_workboard_mirror([s["task_id"] for s in started])
+    update_board(state)
+    return {
+        "ok": True,
+        "retry": bool(started),
+        "started": started,
+        "msg": f"已启动 {len(started)} 个退避到期任务",
+    }
+
+
+@revision_retry
 def error_task(task_id, error_text):
     """Mark a task as non-retryable error.
 
@@ -745,6 +929,7 @@ def error_task(task_id, error_text):
 CLEARABLE_STATUS = ("done", "error", "stopped")
 
 
+@revision_retry
 def clear_task(task_id):
     """Remove a terminal-state task from the board.
 
@@ -775,6 +960,7 @@ def clear_task(task_id):
     return {"ok": True, "msg": f"已清除（history 保留记录）：{task['title']}", "task_id": task_id}
 
 
+@revision_retry
 def release_agent_cmd(agent_id):
     state = load_state()
     if agent_id not in AGENTS:
@@ -816,11 +1002,13 @@ def build_board(state):
         lines.append(f"{info['icon']} **{info['name']}** {icon} {label}{detail}")
 
     # Active tasks (overview only: short titles, capped at BOARD_SECTION_LIMIT)
-    active = [t for t in state["tasks"].values() if t["status"] in ("running", "review", "pending", "error")]
+    active = [t for t in state["tasks"].values()
+              if t["status"] in ("running", "review", "pending", "error", "waiting_retry")]
     running = [t for t in active if t["status"] == "running"]
     review = [t for t in active if t["status"] == "review"]
     pending = [t for t in active if t["status"] == "pending"]
     errors = [t for t in active if t["status"] == "error"]
+    waiting = [t for t in active if t["status"] == "waiting_retry"]
 
     def render_section(title, tasks, key=None, with_id=False):
         lines.append(f"\n**{title}**")
@@ -839,8 +1027,22 @@ def build_board(state):
         if len(tasks) > BOARD_SECTION_LIMIT:
             lines.append(f"… 共 {len(tasks)} 条")
 
+    def render_waiting_section(tasks):
+        """O2：waiting_retry 任务显示预计重试时间，不显示误导性失败计数。"""
+        lines.append("\n**⏰ 等待重试（瞬时失败退避）**")
+        if not tasks:
+            lines.append("无")
+            return
+        shown = sorted(tasks, key=lambda x: x.get("next_retry_at") or "")[:BOARD_SECTION_LIMIT]
+        for t in shown:
+            icon = AGENTS[t["agent"]]["icon"]
+            lines.append(f"{icon} {brief(t['title'])} · `{t['id']}` · 预计重试 {t.get('next_retry_at') or '未知'}")
+        if len(tasks) > BOARD_SECTION_LIMIT:
+            lines.append(f"… 共 {len(tasks)} 条")
+
     render_section("🔄 进行中", running,
                    key=lambda x: x.get("started_at") or x.get("created_at") or "", with_id=True)
+    render_waiting_section(waiting)
     render_section("❌ 失败", errors,
                    key=lambda x: x.get("completed_at") or x.get("created_at") or "", with_id=True)
     render_section("👀 待审核", review,
@@ -882,6 +1084,21 @@ def build_board(state):
     }
 
 
+def _save_board_message_id(message_id):
+    """把 board_message_id 落盘（O1：自带冲突重读重试，不拖累主命令）。"""
+    for _ in range(REVISION_MAX_RETRIES):
+        state = load_state()
+        if state.get("board_message_id") == message_id:
+            return
+        state["board_message_id"] = message_id
+        try:
+            save_state(state)
+            return
+        except RevisionConflictError:
+            continue
+    # 重试耗尽：卡片已发出，仅 message_id 未记账，下次 board 会新发一张，可接受
+
+
 def update_board(state, force_new=False):
     token = get_token()
     card = build_board(state)
@@ -889,7 +1106,7 @@ def update_board(state, force_new=False):
     result = send_card(card, token, mid)
     if result.get("code") == 0:
         state["board_message_id"] = result["data"].get("message_id") or mid
-        save_state(state)
+        _save_board_message_id(state["board_message_id"])
     else:
         return result
 
@@ -939,6 +1156,8 @@ def build_agent_card(state, agent_id):
 
     running = [t for t in state["tasks"].values()
                if t["agent"] == agent_id and t["status"] == "running"]
+    waiting = [t for t in state["tasks"].values()
+               if t["agent"] == agent_id and t["status"] == "waiting_retry"]
     lines.append("\n**🔄 正在处理**")
     if running:
         for t in running:
@@ -949,6 +1168,16 @@ def build_agent_card(state, agent_id):
                 lines.append(f"   └ run `{t['run_id'][:16]}…`")
             if t.get("summary"):
                 lines.append(f"   └ {t['summary'][:80]}")
+    else:
+        lines.append("无")
+
+    lines.append("\n**⏰ 等待重试（瞬时失败退避）**")
+    if waiting:
+        for t in waiting:
+            lines.append(f"**{t['title']}** · `{t['id']}`")
+            lines.append(f"   └ 预计重试 {t.get('next_retry_at') or '未知'}")
+            if t.get("last_error"):
+                lines.append(f"   └ 上次错误：{t['last_error'][:80]}")
     else:
         lines.append("无")
 
@@ -1006,7 +1235,7 @@ def show_agent_detail(agent_id):
     result = send_card(card, token, mid)
     if result.get("code") == 0:
         state["board_message_id"] = result["data"].get("message_id") or mid
-        save_state(state)
+        _save_board_message_id(state["board_message_id"])
     else:
         return result
     # Same PATCH-cache safeguard as update_board.
@@ -1075,7 +1304,7 @@ def dispatch_natural(text):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: BOARD_ACCOUNT=<bot01|bot02|...> [BOARD_OPEN_ID=<open_id>] pipeline.py <board|agent-detail|start|assign|dispatch|complete|review|stop|release|set-result|record-run|fail|error|detail|history|clear> [args]")
+        print("Usage: BOARD_ACCOUNT=<bot01|bot02|...> [BOARD_OPEN_ID=<open_id>] pipeline.py <board|agent-detail|start|assign|dispatch|complete|review|stop|release|set-result|record-run|fail|error|retry-due|detail|history|clear> [args]")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -1157,6 +1386,10 @@ def main():
             print("Usage: pipeline.py error <task_id> <error_text>")
             sys.exit(1)
         result = error_task(sys.argv[2], " ".join(sys.argv[3:]))
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif cmd == "retry-due":
+        # O2：退避到期扫描（sweep），由 cron 定期驱动；幂等，无参
+        result = retry_due_tasks()
         print(json.dumps(result, indent=2, ensure_ascii=False))
     elif cmd == "detail":
         if len(sys.argv) < 3:

@@ -53,7 +53,7 @@ GATEWAY_TIMEOUT_MS = 5000
 # ---------------------------------------------------------------------------
 # 状态映射（设计文档 §2）
 # ---------------------------------------------------------------------------
-# pipeline 6 任务态 → workboard 五态（stopped/error → blocked + label 区分）
+# pipeline 任务态 → workboard 五态（stopped/error/waiting_retry → blocked + label 区分）
 STATUS_MAP = {
     "pending": "todo",
     "running": "running",
@@ -61,6 +61,7 @@ STATUS_MAP = {
     "done": "done",
     "stopped": "blocked",
     "error": "blocked",
+    "waiting_retry": "blocked",
 }
 
 # R1/R4：镜像卡只允许出现的 workboard 状态
@@ -71,7 +72,7 @@ FORBIDDEN_CARD_FIELDS = ("sessionKey", "execution", "runId")
 
 # reconcile / 首帧全量同步时主动建卡的任务状态集合（done/stopped 历史跳过，
 # 设计文档 §2 边界 / §6.1）
-ACTIVE_STATUSES = {"pending", "running", "review", "error"}
+ACTIVE_STATUSES = {"pending", "running", "review", "error", "waiting_retry"}
 
 
 def log(msg):
@@ -254,6 +255,8 @@ def card_labels(account, task):
         labels.append("pipe:error")
     elif status == "stopped":
         labels.append("pipe:stopped")
+    elif status == "waiting_retry":
+        labels.append("pipe:waiting_retry")
     return labels
 
 
@@ -337,6 +340,9 @@ def transition_comment(task, target, last_synced):
         if status == "error":
             return (f"任务失败：{truncate(task.get('last_error') or '（无错误信息）', 120)}"
                     f"（attempts {task.get('attempts') or 0}/{task.get('max_attempts') or 0}）")
+        if status == "waiting_retry":
+            return (f"瞬时失败退避中，预计重试 {task.get('next_retry_at') or '未知'}："
+                    f"{truncate(task.get('last_error') or '（无错误信息）', 120)}")
     return None
 
 
