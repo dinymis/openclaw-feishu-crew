@@ -180,7 +180,8 @@ def ensure_team_config(account_id, name, open_id, out):
     else:
         team["agents"] = {aid: {"model_hint": "your-provider/your-model"}
                           for aid in ("requirement-analyst", "architect",
-                                      "code-reviewer", "coder", "tester")}
+                                      "code-reviewer", "coder", "tester",
+                                      "ops")}
     if isinstance(base.get("card"), dict):
         team["card"] = base["card"]
 

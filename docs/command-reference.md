@@ -30,7 +30,7 @@
 | 命令 | 说明 |
 |---|---|
 | `start <需求标题>` | 创建五阶段流水线（需求分析 → 技术评审 → 编码开发 → 代码评审 → 测试），五个阶段任务共享同一 `parent_id`，阶段 1 立即启动，返回 `parent_id` |
-| `assign <agent_id> <标题>` | 单点派活：登记一个任务并立即分配给指定猴，返回 `task_id`。`agent_id` 取值：`requirement-analyst` / `architect` / `code-reviewer` / `coder` / `tester` |
+| `assign <agent_id> <标题>` | 单点派活：登记一个任务并立即分配给指定猴，返回 `task_id`。`agent_id` 取值：`requirement-analyst` / `architect` / `code-reviewer` / `coder` / `tester` / `ops`（运维猴，单点派活角色，不在五阶段流水线内） |
 | `dispatch <自然语言>` | 自然语言派活：从文本中识别角色关键词（如「技术评审」「编码」「测试」）自动选猴，去掉关键词后作为任务标题 |
 
 ### 任务推进

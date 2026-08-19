@@ -17,7 +17,8 @@
     "architect": {"model_hint": "your-provider/your-model"},
     "code-reviewer": {"model_hint": "your-provider/your-model"},
     "coder": {"model_hint": "your-provider/your-model"},
-    "tester": {"model_hint": "your-provider/your-model"}
+    "tester": {"model_hint": "your-provider/your-model"},
+    "ops": {"model_hint": "your-provider/your-model"}
   },
   "card": {
     "board_title": "🤖 {engineer}智能体 · 多Agent任务看板"

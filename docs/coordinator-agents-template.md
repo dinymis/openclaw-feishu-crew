@@ -66,7 +66,7 @@ This folder is home. Treat it that way.
    BOARD_ACCOUNT=<account_id> python3 scripts/pipeline.py assign <agent_id> "<任务描述>"
    ```
 
-2. **拉起子会话**：用 `sessions_spawn(agentId=<agent_id>, ...)` 启动对应 OpenClaw agent。看板 agent id 必须与 OpenClaw 配置的 agent id 一致（如 `requirement-analyst`、`architect`、`coder`、`code-reviewer`、`tester`）；
+2. **拉起子会话**：用 `sessions_spawn(agentId=<agent_id>, ...)` 启动对应 OpenClaw agent。看板 agent id 必须与 OpenClaw 配置的 agent id 一致（如 `requirement-analyst`、`architect`、`coder`、`code-reviewer`、`tester`、`ops`）；
 3. **记录子会话**：
 
    ```bash

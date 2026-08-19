@@ -114,6 +114,7 @@ AGENT_DEFAULTS = {
     "code-reviewer": {"name": "质检猴", "icon": "✅", "openclaw_agent_id": "code-reviewer", "model_hint": "", "aliases": ["代码review", "代码评审", "质检", "review代码", "质检猴"]},
     "coder": {"name": "编码猴", "icon": "💻", "openclaw_agent_id": "coder", "model_hint": "", "aliases": ["编码", "开发", "写代码", "coder", "程序员", "编码猴"]},
     "tester": {"name": "测试猴", "icon": "🧪", "openclaw_agent_id": "tester", "model_hint": "", "aliases": ["测试", "tester", "写测试", "qa", "测试猴"]},
+    "ops": {"name": "运维猴", "icon": "🔧", "openclaw_agent_id": "ops", "model_hint": "", "aliases": ["运维", "部署", "上线", "sre", "ops", "运维猴"]},
 }
 
 
