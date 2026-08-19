@@ -15,6 +15,8 @@ OpenClaw 单 agent 会话是「一个全能助理」；本项目把它变成「�
 - **看板即状态机**：任务状态 `pending → running → review → done`（另有 `stopped` / `error`），全部落盘在 `task-state-<account_id>.json`；
 - **派活闭环**：`assign` 登记看板 → 协调猴用 `sessions_spawn(agentId=...)` 拉起子猴 → `record-run` 记录子会话 → 成功后 `set-result` / `complete`；
 - **重试纪律**：`fail`（瞬时错误，任务级退避重试，默认 max_attempts=3）vs `error`（权限/配置类，不重试）。
+- **通用卡片发送器**：`scripts/feishu_card.py` 独立渲染「Agent 管理控制台」看板卡片（已注册 Agent + 流水线阶段 + 操作按钮），支持发送新卡片与更新已有卡片，凭据全部走环境变量/config 分层；
+- **开箱即用的协调猴模板**：`docs/coordinator-agents-template.md` 把看板规则、派活闭环、重试纪律、路径解析、心跳巡检等机制抽象成带 `<占位符>` 的通用 AGENTS.md 模板；`docs/command-reference.md` 是 pipeline.py 全量命令手册（含典型工作流示例）。
 
 **镜像层（可选）**：pipeline 台账还可单向只读镜像到 OpenClaw Workboard 插件（Control UI 看板），每个账号一块 `pipeline-<account>` board，供管理端观察任务流转。镜像层完全独立、单向（台账是唯一事实源）、失败静默降级不阻塞主流程——**未启用 workboard 插件时触发即静默跳过，零影响**；设计见 [docs/workboard-bridge.md](docs/workboard-bridge.md)。
 
@@ -62,6 +64,7 @@ python3 scripts/setup.py --offline    # 可选：跳过 doctor 联网探测
 
 - 配置层结构与优先级、占位符填写方法见 **`config/README.md`**；OpenClaw 侧的多 agent / 多账号配置模板见 **`openclaw.example.json`**；
 - 整体架构（账号→工程师→看板→五猴流水线与状态机）见 **`docs/architecture.md`**；
+- 协调猴工作区怎么落地（看板规则/派活闭环/重试纪律/路径解析/心跳巡检）见 **`docs/coordinator-agents-template.md`**；命令全量清单与典型工作流见 **`docs/command-reference.md`**；
 - 代码不含业务敏感值，配置缺失时自动退化到代码默认值；
 - 环境变量：`BOARD_ACCOUNT`（当前工程师账号 id）、`BOARD_OPEN_ID`（发送者 open_id）由协调猴在每次调用时传入。
 
@@ -102,6 +105,10 @@ python3 scripts/workboard-mirror.py cleanup <account_id> <task_id> ...  # 清理
 
 # 项目路径解析（别名 → 任务前导语，含「必读项目 AGENTS.md」指令注入）
 python3 scripts/resolve-project.py <项目别名> [服务别名]
+
+# 通用飞书卡片发送器（渲染 Agent 管理控制台卡片；发送新卡片或 --update 更新已有卡片）
+BOARD_ACCOUNT=bot01 python3 scripts/feishu_card.py <open_id> ['{"stages": [...]}']
+BOARD_ACCOUNT=bot01 python3 scripts/feishu_card.py --update <message_id> ['{"stages": [...]}']
 ```
 
 ### fail/retry 行为说明
@@ -145,6 +152,7 @@ openclaw-feishu-crew/
 │   ├── workboard-mirror.py    # 可选：pipeline → Workboard 单向镜像层
 │   ├── doctor.py              # 一键自检（含 --fix 交互补全）
 │   ├── add-engineer.py        # 一键新增工程师（三处同步 + doctor 复查）
+│   ├── feishu_card.py         # 通用飞书卡片发送器（渲染看板卡片 + 发送/更新卡片）
 │   └── resolve-project.py     # 项目别名 → 任务前导语
 ├── config/
 │   ├── README.md              # 配置层说明与优先级
@@ -153,6 +161,8 @@ openclaw-feishu-crew/
 │       └── bot01.json.example # per-account 飞书凭证模板
 ├── docs/
 │   ├── architecture.md        # 整体架构与状态机说明
+│   ├── coordinator-agents-template.md  # 协调猴 AGENTS.md 通用模板（带 <占位符>）
+│   ├── command-reference.md   # pipeline.py 全量命令手册 + 典型工作流
 │   ├── workboard-bridge.md    # Workboard 镜像层设计（单向只读，可选）
 │   └── feishu-app-setup.md    # 飞书自建应用搭建 SOP
 ├── projects.example.json      # 项目登记模板（虚构 demo-shop）

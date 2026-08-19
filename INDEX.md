@@ -31,8 +31,11 @@ openclaw gateway restart                              # 然后对 bot 说「看�
 | `scripts/pipeline.py` | 核心：看板状态机 + 命令层 | 理解/改动看板逻辑、扩展命令时 |
 | `scripts/doctor.py` | 一键自检（配置完整性/对齐/凭证连通性）；`--fix` 交互补全 | 部署收尾复查、诊断「为什么没生效」时 |
 | `scripts/add-engineer.py` | 一键新增工程师（三处同步 + doctor 复查） | 用户要「加一位工程师/bot」时 |
+| `scripts/feishu_card.py` | 通用飞书卡片发送器（渲染 Agent 管理控制台卡片 + 发送/更新） | 需要独立发送/更新看板卡片、或改造卡片样式时 |
 | `scripts/resolve-project.py` | 项目别名 → 任务前导语（含必读 AGENTS.md 注入） | 派活涉及多项目路由时 |
 | `docs/architecture.md` | 整体架构图与状态机说明 | 理解账号→工程师→看板→流水线全链路时 |
+| `docs/coordinator-agents-template.md` | 协调猴 AGENTS.md 通用模板（带 `<占位符>`） | 新建/改造协调猴工作区 AGENTS.md 时 |
+| `docs/command-reference.md` | pipeline.py 全量命令手册 + 典型工作流 | 查命令用法、环境变量、编排示例时 |
 | `docs/feishu-app-setup.md` | 飞书自建应用搭建 SOP（含踩坑） | 建飞书应用、排查 99991672 / HTTP 400 / open_id 时 |
 | `tests/smoke_test.py` | 离线冒烟：状态机闭环验收 | 改完 pipeline 后跑通验收 |
 | `tests/doctor_test.py` | doctor / add-engineer / --fix 自测 | 改完 doctor 或 add-engineer 后跑通 |
