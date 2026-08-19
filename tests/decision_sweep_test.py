@@ -232,18 +232,24 @@ check("retry-due 无到期任务幂等", r.get("started") == [] and r.get("decid
 
 print("== 3) O7b sweep findings 四类齐全 + 卡死一个周期内命中（验收③） ==")
 state = pipeline.load_state()
-# 造四类异常任务（直接改台账，模拟真实事故现场）
+# 造四类异常任务（直接改台账，模拟真实事故现场）。
+# 时间戳一律用「当前时间 - N 秒」动态生成，不写死时间串：
+# CI 为 UTC 时区，写死的本地时间串在 CI 上可能在未来，导致 elapsed 为负不命中。
+def ago_ts(seconds):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - seconds))
+
+OLD = ago_ts(3600)  # 1 小时前，远超各测试阈值（stale 60s / pending 120s / grace 30s）
 
 # 3.1 stale_running：running 超阈值无进展（无 run_id）
 tid_stale = "task-1700000001-stale1"
 state["tasks"][tid_stale] = {
     "id": tid_stale, "title": "模拟卡死任务", "status": "running", "agent": "coder",
     "stage": "编码开发", "progress": 0, "result": None, "summary": "",
-    "created_at": "2026-08-19 08:00:00", "started_at": "2026-08-19 08:00:00",
+    "created_at": OLD, "started_at": OLD,
     "completed_at": None, "message_id": None, "parent_id": None, "sequence": 1,
     "attempts": 1, "max_attempts": 3, "last_error": "", "run_id": "",
     "child_session_key": "", "next_retry_at": None,
-    "last_activity_at": "2026-08-19 08:00:00",
+    "last_activity_at": OLD,
 }
 # 3.2 ledger_no_progress：有 run_id 但长期无进展
 tid_ledger = "task-1700000002-ledgr2"
@@ -261,7 +267,7 @@ tid_ovd = "task-1700000004-ovdue4"
 state["tasks"][tid_ovd] = dict(state["tasks"][tid_stale])
 state["tasks"][tid_ovd].update(
     {"id": tid_ovd, "title": "模拟重试超期任务", "status": "waiting_retry",
-     "next_retry_at": "2026-08-19 08:00:00", "attempts": 1, "run_id": ""})
+     "next_retry_at": OLD, "attempts": 1, "run_id": ""})
 pipeline.save_state(state)
 
 r = pipeline.sweep_tasks()
@@ -284,8 +290,7 @@ tid_dead = "task-1700000005-deadn5"
 state = pipeline.load_state()
 state["tasks"][tid_dead] = dict(state["tasks"][tid_stale])
 state["tasks"][tid_dead].update(
-    {"id": tid_dead, "title": "刚卡死的任务",
-     "last_activity_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 120))})
+    {"id": tid_dead, "title": "刚卡死的任务", "last_activity_at": ago_ts(120)})
 pipeline.save_state(state)
 orig = pipeline.sweep_stale_running_seconds
 pipeline.sweep_stale_running_seconds = lambda: 60  # 测试阈值 60s，120s 前活动必命中
