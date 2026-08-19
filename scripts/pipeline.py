@@ -5,7 +5,7 @@ Supports both full pipeline tasks (4 stages) and ad-hoc assignments
 to individual agents. Each agent can hold one task at a time.
 """
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 import fcntl
 import json
@@ -49,6 +49,10 @@ DEFAULT_SWEEP_PENDING_AGE_SECONDS = 21600
 # waiting_retry 超过 next_retry_at 多久仍未被 retry-due 拉起视为异常（秒）；
 # team.json sweep.waiting_retry_grace_seconds 可配，默认 1800。
 DEFAULT_SWEEP_WAITING_RETRY_GRACE_SECONDS = 1800
+# O9：已取消（stop 且取消意图在）但子会话疑似仍活跃的关注窗口（秒）：
+# 取消后窗口内且 run_id 已登记 → 产出 cancelled_active finding；
+# team.json sweep.cancelled_active_window_seconds 可配，默认 2h。
+DEFAULT_SWEEP_CANCELLED_ACTIVE_WINDOW_SECONDS = 7200
 
 # O2：瞬时错误关键词（fail 命令自动检测，命中 → waiting_retry 退避，
 # 不烧 attempts；未命中视为权限/配置类错误 → error 终态不重试）。
@@ -196,6 +200,7 @@ STATUS_ICON = {
     "idle": "⏸",
     "waiting_retry": "⏰",
     "waiting_decision": "🗳️",
+    "blocked": "🚧",
 }
 
 STATUS_LABEL = {
@@ -208,6 +213,7 @@ STATUS_LABEL = {
     "idle": "空闲",
     "waiting_retry": "等待重试",
     "waiting_decision": "等待决策",
+    "blocked": "卡住等输入",
 }
 
 
@@ -301,6 +307,16 @@ def normalize_task(task):
     task.setdefault("child_session_key", "")
     task.setdefault("next_retry_at", None)
     task.setdefault("last_activity_at", None)
+    # O8 blocked 态：blockedTaskId=卡住来源任务 id（等上游产物时），
+    # blocked_reason=卡住原因，blocked_from=挂起前状态（unblock 恢复用）。
+    task.setdefault("blockedTaskId", "")
+    task.setdefault("blocked_reason", "")
+    task.setdefault("blocked_from", "")
+    task.setdefault("blocked_at", None)
+    # O9 sticky cancel：取消意图持久化（stop 时写入，重启不丢），
+    # assign/dispatch 补 spawn 前检查该标志，在则拒绝并提示 unstop。
+    task.setdefault("cancel_requested", False)
+    task.setdefault("cancel_requested_at", None)
     return task
 
 
@@ -601,6 +617,11 @@ def start_task_assignment(state, task_id):
     task = state["tasks"].get(task_id)
     if not task:
         return False, "任务不存在"
+    # O9 sticky cancel：带取消意图的任务拒绝启动（retry-due/补派活路径共用）。
+    if task.get("cancel_requested"):
+        return False, (f"任务已取消（sticky 意图在，取消于 "
+                       f"{task.get('cancel_requested_at') or '未知'}），"
+                       f"拒绝补 spawn；如确需继续请先 unstop {task_id}")
     if task["status"] != "pending":
         return False, f"任务状态不是待分配：{task['status']}"
     agent_id = task["agent"]
@@ -723,12 +744,59 @@ def stop_task(task_id):
         return {"ok": False, "msg": "已完成任务不能停止"}
     agent_id = task["agent"]
     release_agent(state, agent_id)
+    # O9 sticky cancel：取消意图持久化到 state（重启不丢），
+    # 后续对该任务的补 spawn（retry-due 拉起 / record-run 登记）会被拒绝；
+    # unstop 命令可清除意图反悔。stopped_from 记录停止前状态供 unstop 恢复。
+    task["stopped_from"] = task["status"]
     task["status"] = "stopped"
     task["completed_at"] = now()
+    task["cancel_requested"] = True
+    task["cancel_requested_at"] = now()
     save_state(state)
-    _trigger_workboard_mirror([task_id])
+    _trigger_workboard_mirror([task_id], comment="人工停止（取消意图已持久化，补 spawn 将被拒绝；unstop 可反悔）")
     update_board(state)
-    return {"ok": True, "msg": f"已停止：{task['title']}"}
+    return {"ok": True,
+            "cancel_requested": True,
+            "msg": f"已停止：{task['title']}（取消意图已记录，补 spawn 将被拒绝；unstop 可反悔）"}
+
+
+@revision_retry
+def unstop_task(task_id):
+    """O9：清除取消意图（用户反悔）。
+
+    stopped 任务恢复为停止前状态（stopped_from，缺省 pending）：
+    原状态为 running/review 时重新占用 agent；其余回到 pending 排队。
+    非 stopped 任务仅清除残留意图标志（如意图在但状态已被其他命令改动）。
+    """
+    state = load_state()
+    task = state["tasks"].get(task_id)
+    if not task:
+        return {"ok": False, "msg": "任务不存在"}
+    had_intent = bool(task.get("cancel_requested"))
+    task["cancel_requested"] = False
+    task["cancel_requested_at"] = None
+    restored = None
+    if task["status"] == "stopped":
+        prev = task.get("stopped_from") or "pending"
+        if prev in ("running", "review"):
+            assign_agent(state, task["agent"], task_id)
+            task["status"] = prev
+            task["completed_at"] = None
+            task["last_activity_at"] = now()
+            restored = prev
+        else:
+            task["status"] = "pending"
+            task["completed_at"] = None
+            restored = "pending"
+    save_state(state)
+    _trigger_workboard_mirror([task_id], comment="取消意图已清除（unstop）")
+    update_board(state)
+    return {"ok": True,
+            "had_intent": had_intent,
+            "restored": restored,
+            "status": task["status"],
+            "msg": (f"取消意图已清除：{task['title']}"
+                    + (f"（恢复为 {restored}）" if restored else ""))}
 
 
 @revision_retry
@@ -754,6 +822,13 @@ def record_task_run(task_id, run_id=None, child_session_key=None):
     task = state["tasks"].get(task_id)
     if not task:
         return {"ok": False, "msg": "任务不存在"}
+    # O9 sticky cancel：已停止且取消意图在的任务拒绝补登记 spawn，
+    # 明确报错提示（而非静默新建/静默拉起）；unstop 可反悔。
+    if task.get("cancel_requested") and task.get("status") in ("stopped", "error"):
+        return {"ok": False,
+                "cancel_requested": True,
+                "msg": (f"任务已取消（sticky 意图在，取消于 {task.get('cancel_requested_at') or '未知'}），"
+                        f"拒绝补登记 spawn；如确需继续请先 unstop {task_id}")}
     if run_id:
         task["run_id"] = run_id
     if child_session_key:
@@ -1175,10 +1250,20 @@ def retry_due_tasks():
            and (t.get("next_retry_at") or "") <= now_str]
     expired_decisions = _collect_expired_decisions(state)
     if not due and not expired_decisions:
-        return {"ok": True, "started": [], "decided": [], "msg": "无到点重试/决策任务"}
+        return {"ok": True, "started": [], "decided": [], "cancelled": [],
+                "msg": "无到点重试/决策任务"}
 
     started = []
+    cancelled = []
     for task in sorted(due, key=lambda x: x.get("next_retry_at") or ""):
+        # O9 sticky cancel：退避期内被 stop 的理论上已不是 waiting_retry，
+        # 但防御性检查：若取消意图在则不拉起，转 stopped 终态并留痕。
+        if task.get("cancel_requested"):
+            task["next_retry_at"] = None
+            task["status"] = "stopped"
+            task["summary"] = "退避到期但取消意图在，拒绝拉起（sticky cancel）"
+            cancelled.append({"task_id": task["id"], "agent_id": task["agent"]})
+            continue
         task["next_retry_at"] = None
         task["status"] = "pending"  # 回归可分配态，再由 start_task_assignment 真启动
         ok, err = start_task_assignment(state, task["id"])
@@ -1204,15 +1289,18 @@ def retry_due_tasks():
 
     save_state(state)
     _trigger_workboard_mirror([s["task_id"] for s in started] +
-                              [d["task_id"] for d in decided])
+                              [d["task_id"] for d in decided] +
+                              [c["task_id"] for c in cancelled])
     update_board(state)
     return {
         "ok": True,
         "retry": bool(started),
         "started": started,
         "decided": decided,
+        "cancelled": cancelled,
         "msg": (f"已启动 {len(started)} 个退避到期任务，"
-                f"已按默认策略决策 {len(decided)} 个限时任务"),
+                f"已按默认策略决策 {len(decided)} 个限时任务"
+                + (f"，拒绝拉起已取消 {len(cancelled)} 个" if cancelled else "")),
     }
 
 
@@ -1252,12 +1340,98 @@ def error_task(task_id, error_text):
 CLEARABLE_STATUS = ("done", "error", "stopped")
 
 
+# --- O8 blocked 态 ---------------------------------------------------------
+# blocked = 「卡住等输入」（等用户确认/等上游产物），与「失败」（error）明确区分：
+# 不是错误，也不烧 attempts，只是需要外部输入才能继续。看板显示 blocked 区
+# 与卡住原因（blocked_reason），若卡在等上游产物可同时记 blockedTaskId
+# （卡住来源任务 id）。unblock 恢复到挂起前状态（blocked_from）继续流转。
+
+BLOCK_SUSPENDABLE_STATUS = ("running", "review", "pending")
+
+
+@revision_retry
+def block_task(task_id, reason, blocked_task_id=None):
+    """O8：把任务挂起为 blocked（卡住等输入），agent 释放不占坑。
+
+    reason 为卡住原因（必填）；blocked_task_id 可选：若卡住是等上游任务
+    产物，记来源任务 id（blockedTaskId）。仅非终态活动任务可挂起。
+    """
+    state = load_state()
+    task = state["tasks"].get(task_id)
+    if not task:
+        return {"ok": False, "msg": "任务不存在"}
+    if not (reason or "").strip():
+        return {"ok": False, "msg": "卡住原因不能为空"}
+    if task["status"] not in BLOCK_SUSPENDABLE_STATUS:
+        return {"ok": False,
+                "msg": f"当前状态 {task['status']} 不可挂起为 blocked"
+                       f"（仅 {'/'.join(BLOCK_SUSPENDABLE_STATUS)}）"}
+    if blocked_task_id and blocked_task_id not in state["tasks"]:
+        return {"ok": False, "msg": f"blockedTaskId 不存在：{blocked_task_id}"}
+
+    release_agent(state, task["agent"])
+    task["blocked_from"] = task["status"]
+    task["status"] = "blocked"
+    task["blocked_reason"] = reason.strip()
+    task["blockedTaskId"] = blocked_task_id or ""
+    task["blocked_at"] = now()
+    task["summary"] = f"卡住等输入：{task['blocked_reason'][:120]}"
+    save_state(state)
+    _trigger_workboard_mirror(
+        [task_id],
+        comment=(f"卡住等输入：{task['blocked_reason'][:120]}"
+                 + (f"（等上游任务 {blocked_task_id}）" if blocked_task_id else "")))
+    update_board(state)
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "status": "blocked",
+        "blockedTaskId": task["blockedTaskId"],
+        "msg": (f"任务已挂起为 blocked（卡住等输入）：{task['title']}"
+                f"；原因：{task['blocked_reason']}"
+                + (f"；等上游任务：{blocked_task_id}" if blocked_task_id else "")),
+    }
+
+
+@revision_retry
+def unblock_task(task_id):
+    """O8：解除 blocked，恢复到挂起前状态继续流转。
+
+    blocked_from 为 running/review 时重新占用 agent；其余回到 pending 排队。
+    """
+    state = load_state()
+    task = state["tasks"].get(task_id)
+    if not task:
+        return {"ok": False, "msg": "任务不存在"}
+    if task["status"] != "blocked":
+        return {"ok": False, "msg": f"任务不在 blocked 状态（当前：{task['status']}），无需 unblock"}
+    prev = task.get("blocked_from") or "pending"
+    if prev in ("running", "review"):
+        assign_agent(state, task["agent"], task_id)
+        task["status"] = prev
+        task["last_activity_at"] = now()
+    else:
+        task["status"] = "pending"
+    task["summary"] = f"已解除卡住（原原因：{(task.get('blocked_reason') or '')[:80]}），恢复为 {task['status']}"
+    restored = task["status"]
+    task["blocked_reason"] = ""
+    task["blockedTaskId"] = ""
+    task["blocked_from"] = ""
+    task["blocked_at"] = None
+    save_state(state)
+    _trigger_workboard_mirror([task_id], comment=f"解除卡住，恢复为 {restored}")
+    update_board(state)
+    return {"ok": True, "task_id": task_id, "status": restored,
+            "msg": f"已解除卡住，恢复为 {restored}：{task['title']}"}
+
+
 # --- O7b audit/sweeper 完整版 ---------------------------------------------
-# pipeline.py sweep：巡检四类异常 findings：
+# pipeline.py sweep：巡检五类异常 findings：
 #   1. stale_running      running 超阈值无任何进展（last_activity_at/started_at）
 #   2. pending_aged       pending 超龄未分配
 #   3. retry_overdue      waiting_retry 超过 next_retry_at+宽限仍未被拉起
 #   4. ledger_no_progress 有账无会话：run_id 已登记但长期无状态变化
+#   5. cancelled_active   O9：已取消但子会话疑似仍活跃（有 run_id 无进展）
 # findings 输出结构化 JSON + 人类可读摘要；--notify 经 feishu_card.py 发
 # 告警卡（凭据缺失静默跳过）；幂等：同一 finding（type+task_id 指纹）
 # 已告警过且未消除前不重复告警（sweep-state 记 last_notified 指纹）。
@@ -1279,6 +1453,11 @@ def sweep_pending_age_seconds():
 def sweep_waiting_retry_grace_seconds():
     return int(sweep_config().get("waiting_retry_grace_seconds")
                or DEFAULT_SWEEP_WAITING_RETRY_GRACE_SECONDS)
+
+
+def sweep_cancelled_active_window_seconds():
+    return int(sweep_config().get("cancelled_active_window_seconds")
+               or DEFAULT_SWEEP_CANCELLED_ACTIVE_WINDOW_SECONDS)
 
 
 def sweep_state_path():
@@ -1318,11 +1497,17 @@ def _task_progress_ts(task):
 
 
 def collect_findings(state, now_ts=None):
-    """O7b：扫描台账产出四类 findings（纯计算，不改台账）。"""
+    """O7b/O9：扫描台账产出 findings（纯计算，不改台账）。
+
+    四类常规 findings（stale_running/pending_aged/retry_overdue/
+    ledger_no_progress）+ O9 一类：cancelled_active（已取消但子会话
+    疑似仍活跃：stop 且取消意图在、run_id 已登记、取消后窗口内无任何进展）。
+    """
     now_ts = now_ts if now_ts is not None else time.time()
     stale_s = sweep_stale_running_seconds()
     pending_s = sweep_pending_age_seconds()
     grace_s = sweep_waiting_retry_grace_seconds()
+    cancel_window_s = sweep_cancelled_active_window_seconds()
     findings = []
 
     def add(ftype, task, detail, age):
@@ -1365,6 +1550,16 @@ def collect_findings(state, now_ts=None):
                 add("retry_overdue", task,
                     f"next_retry_at={task.get('next_retry_at')} 已过宽限期仍未被 retry-due 拉起",
                     now_ts - due_ts)
+        elif status == "stopped" and task.get("cancel_requested") and task.get("run_id"):
+            # O9：已取消但子会话疑似仍活跃——run_id 已登记（说明子会话被拉起过），
+            # 取消后窗口内仍无任何后续进展（set-result/complete），提醒人工确认
+            # 子会话是否真的已停。超过关注窗口后不再提醒（大概率已自然结束）。
+            cancel_ts = _parse_ts(task.get("cancel_requested_at"))
+            if cancel_ts is not None and 0 <= now_ts - cancel_ts <= cancel_window_s:
+                add("cancelled_active", task,
+                    f"已取消（{task.get('cancel_requested_at')}）但 run_id 已登记且无后续进展，"
+                    f"子会话可能仍在活跃，请确认是否需手动终止",
+                    now_ts - cancel_ts)
     return findings
 
 
@@ -1486,8 +1681,12 @@ def release_agent_cmd(agent_id):
     for task_id in current:
         task = state["tasks"].get(task_id)
         if task and task["status"] == "running":
+            # 与 stop 语义一致：release 停掉的任务同样持久化取消意图（O9）
+            task["stopped_from"] = task["status"]
             task["status"] = "stopped"
             task["completed_at"] = now()
+            task["cancel_requested"] = True
+            task["cancel_requested_at"] = now()
     release_agent(state, agent_id)
     save_state(state)
     _trigger_workboard_mirror(current)
@@ -1521,13 +1720,14 @@ def build_board(state):
     # Active tasks (overview only: short titles, capped at BOARD_SECTION_LIMIT)
     active = [t for t in state["tasks"].values()
               if t["status"] in ("running", "review", "pending", "error",
-                                 "waiting_retry", "waiting_decision")]
+                                 "waiting_retry", "waiting_decision", "blocked")]
     running = [t for t in active if t["status"] == "running"]
     review = [t for t in active if t["status"] == "review"]
     pending = [t for t in active if t["status"] == "pending"]
     errors = [t for t in active if t["status"] == "error"]
     waiting = [t for t in active if t["status"] == "waiting_retry"]
     decisions = [t for t in active if t["status"] == "waiting_decision"]
+    blocked = [t for t in active if t["status"] == "blocked"]
 
     def render_section(title, tasks, key=None, with_id=False):
         lines.append(f"\n**{title}**")
@@ -1578,8 +1778,30 @@ def build_board(state):
         if len(tasks) > BOARD_SECTION_LIMIT:
             lines.append(f"… 共 {len(tasks)} 条")
 
+    def render_blocked_section(tasks):
+        """O8：blocked 卡住等输入区，显示卡住原因与 blockedTaskId（若等上游产物）。
+
+        与 error（失败）明确区分：blocked 不是错误，只是需要外部输入才能继续。
+        """
+        lines.append("\n**🚧 卡住等输入（blocked）**")
+        if not tasks:
+            lines.append("无")
+            return
+        shown = sorted(tasks, key=lambda x: x.get("blocked_at") or "")[:BOARD_SECTION_LIMIT]
+        for t in shown:
+            icon = AGENTS[t["agent"]]["icon"]
+            extra = ""
+            if t.get("blockedTaskId"):
+                extra = f" · 等上游 `{t['blockedTaskId']}`"
+            lines.append(
+                f"{icon} {brief(t['title'])} · `{t['id']}`"
+                f" · {(t.get('blocked_reason') or '未知原因')[:40]}{extra}")
+        if len(tasks) > BOARD_SECTION_LIMIT:
+            lines.append(f"… 共 {len(tasks)} 条")
+
     render_section("🔄 进行中", running,
                    key=lambda x: x.get("started_at") or x.get("created_at") or "", with_id=True)
+    render_blocked_section(blocked)
     render_decision_section(decisions)
     render_waiting_section(waiting)
     render_section("❌ 失败", errors,
@@ -1699,6 +1921,8 @@ def build_agent_card(state, agent_id):
                if t["agent"] == agent_id and t["status"] == "waiting_retry"]
     decisions = [t for t in state["tasks"].values()
                  if t["agent"] == agent_id and t["status"] == "waiting_decision"]
+    blocked = [t for t in state["tasks"].values()
+               if t["agent"] == agent_id and t["status"] == "blocked"]
     lines.append("\n**🔄 正在处理**")
     if running:
         for t in running:
@@ -1709,6 +1933,18 @@ def build_agent_card(state, agent_id):
                 lines.append(f"   └ run `{t['run_id'][:16]}…`")
             if t.get("summary"):
                 lines.append(f"   └ {t['summary'][:80]}")
+    else:
+        lines.append("无")
+
+    lines.append("\n**🚧 卡住等输入（blocked）**")
+    if blocked:
+        for t in blocked:
+            lines.append(f"**{t['title']}** · `{t['id']}`")
+            lines.append(f"   └ 原因：{(t.get('blocked_reason') or '未知')[:80]}")
+            if t.get("blockedTaskId"):
+                lines.append(f"   └ 等上游任务 `{t['blockedTaskId']}`")
+            if t.get("blocked_at"):
+                lines.append(f"   └ 卡住于 {t['blocked_at']}")
     else:
         lines.append("无")
 
@@ -1855,7 +2091,7 @@ def dispatch_natural(text):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: BOARD_ACCOUNT=<bot01|bot02|...> [BOARD_OPEN_ID=<open_id>] pipeline.py <board|agent-detail|start|assign|dispatch|complete|review|stop|release|set-result|record-run|fail|error|retry-due|request-decision|decide|sweep|detail|history|clear> [args]")
+        print("Usage: BOARD_ACCOUNT=<bot01|bot02|...> [BOARD_OPEN_ID=<open_id>] pipeline.py <board|agent-detail|start|assign|dispatch|complete|review|stop|unstop|release|set-result|record-run|fail|error|block|unblock|retry-due|request-decision|decide|sweep|detail|history|clear> [args]")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -1904,6 +2140,13 @@ def main():
             sys.exit(1)
         result = stop_task(sys.argv[2])
         print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif cmd == "unstop":
+        # O9：清除取消意图（用户反悔），stopped 任务恢复为停止前状态
+        if len(sys.argv) < 3:
+            print("Usage: pipeline.py unstop <task_id>")
+            sys.exit(1)
+        result = unstop_task(sys.argv[2])
+        print(json.dumps(result, indent=2, ensure_ascii=False))
     elif cmd == "release":
         if len(sys.argv) < 3:
             print("Usage: pipeline.py release <agent_id>")
@@ -1937,6 +2180,27 @@ def main():
             print("Usage: pipeline.py error <task_id> <error_text>")
             sys.exit(1)
         result = error_task(sys.argv[2], " ".join(sys.argv[3:]))
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif cmd == "block":
+        # O8：把任务挂起为 blocked（卡住等输入）
+        if len(sys.argv) < 4:
+            print("Usage: pipeline.py block <task_id> <卡住原因> [--blocked-task-id <上游任务id>]")
+            sys.exit(1)
+        blocked_task_id = None
+        if "--blocked-task-id" in sys.argv:
+            idx = sys.argv.index("--blocked-task-id")
+            if idx + 1 < len(sys.argv):
+                blocked_task_id = sys.argv[idx + 1]
+                sys.argv = sys.argv[:idx] + sys.argv[idx + 2:]
+        reason = " ".join(sys.argv[3:])
+        result = block_task(sys.argv[2], reason, blocked_task_id=blocked_task_id)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif cmd == "unblock":
+        # O8：解除 blocked，恢复流转
+        if len(sys.argv) < 3:
+            print("Usage: pipeline.py unblock <task_id>")
+            sys.exit(1)
+        result = unblock_task(sys.argv[2])
         print(json.dumps(result, indent=2, ensure_ascii=False))
     elif cmd == "retry-due":
         # O2/O6：退避到期 + 决策限时扫描（sweep），由 cron 定期驱动；幂等，无参

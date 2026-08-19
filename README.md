@@ -103,13 +103,16 @@ python3 scripts/pipeline.py record-run <task_id> [run_id] [child_session_key]  #
 python3 scripts/pipeline.py set-result <task_id> <结果> [摘要]  # 保存结果并转审核
 python3 scripts/pipeline.py complete <task_id>         # 完成任务（自动推进流水线下一阶段）
 python3 scripts/pipeline.py review <task_id>           # 提交审核
-python3 scripts/pipeline.py stop <task_id>             # 停止任务
+python3 scripts/pipeline.py stop <task_id>             # 停止任务（sticky：持久化取消意图，补 spawn 被拒；unstop 反悔）
+python3 scripts/pipeline.py unstop <task_id>           # 清除取消意图（反悔），恢复为停止前状态
+python3 scripts/pipeline.py block <task_id> <原因> [--blocked-task-id <上游任务id>]  # 挂起为卡住等输入（blocked，与 error 区分）
+python3 scripts/pipeline.py unblock <task_id>          # 解除卡住，恢复流转
 python3 scripts/pipeline.py fail <task_id> <错误>      # 失败（瞬时错误自动退避重试）
 python3 scripts/pipeline.py error <task_id> <错误>     # 失败（不可重试）
 python3 scripts/pipeline.py retry-due                  # 退避到期+决策限时扫描（cron 驱动，幂等）
 python3 scripts/pipeline.py request-decision <task_id> <问题> [--options a,b] [--tier low|medium|high]  # 挂起等待用户决策（发决策卡）
 python3 scripts/pipeline.py decide <task_id> approve|reject|defer  # 用户拍板入口
-python3 scripts/pipeline.py sweep [--notify]           # 巡检：四类异常 findings（可选发告警卡，幂等去重）
+python3 scripts/pipeline.py sweep [--notify]           # 巡检：五类异常 findings（可选发告警卡，幂等去重）
 python3 scripts/pipeline.py release <agent_id>         # 释放猴
 python3 scripts/pipeline.py detail <task_id>           # 任务详情
 python3 scripts/pipeline.py history                    # 历史任务
@@ -138,11 +141,16 @@ BOARD_ACCOUNT=bot01 python3 scripts/feishu_card.py --update <message_id> ['{"sta
 ### 决策等待与巡检（O6/O7b）
 
 - `request-decision` 把任务挂起为 `waiting_decision`（agent 释放，并行线不阻塞），决策卡经 `scripts/feishu_card.py` 发送（批准/否决/转交三按钮，档位文案全部经 team.json `decision`/`decision_card` 段配置化）；`decide approve|reject|defer` 为卡片回调与手工命令共用入口，决策记录写入 `task.decision.log` 留痕；
-- `sweep` 产出四类 findings：`stale_running`（running 超阈值无进展，默认 2h）、`pending_aged`（待分配超龄）、`retry_overdue`（退避超期未拉起）、`ledger_no_progress`（run_id 已登记但长期无进展）；`--notify` 发告警卡（凭据缺失静默），同一 finding 未消除前不重复告警（sweep-state 指纹去重）。
+- `sweep` 产出五类 findings：`stale_running`（running 超阈值无进展，默认 2h）、`pending_aged`（待分配超龄）、`retry_overdue`（退避超期未拉起）、`ledger_no_progress`（run_id 已登记但长期无进展）、`cancelled_active`（O9：已取消但子会话疑似仍活跃）；`--notify` 发告警卡（凭据缺失静默），同一 finding 未消除前不重复告警（sweep-state 指纹去重）。
+
+### 卡住等输入与 sticky cancel（O8/O9）
+
+- `block <task_id> <原因> [--blocked-task-id <上游任务id>]` 把任务挂起为 `blocked`（卡住等输入：等用户确认/等上游产物），与「失败」（`error`）明确区分：不是错误、不烧 attempts；看板显示「🚧 卡住等输入」区（原因 + blockedTaskId）；`unblock` 恢复到挂起前状态继续流转；
+- `stop` 同时持久化取消意图（`cancel_requested` + 时间戳，重启不丢）：之后对该任务的补 spawn（retry-due 拉起 / record-run 登记）被拒绝并提示 unstop（明确报错而非静默新建），堵住「停了又被拉起」；`unstop` 清除意图反悔；sweep 对取消后仍疑似活跃（有 run_id 无进展）的任务产出 `cancelled_active` finding。
 
 ## 冒烟验收边界
 
-- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；`tests/setup_test.py` 验证 setup.py 骨架生成 / 幂等 / `--apply` 备份（均为临时目录虚构配置，不碰仓库 config/）；`tests/deploy_smoke_test.py` 端到端验证一键部署闭环（deploy.sh 真实执行 + 状态机全闭环 + revision 乐观锁 / waiting_retry 退避 / retry-due 幂等新机制 + feishu_card.py 卡片渲染与发送路径 mock）；`tests/mirror_test.py` 用 mock RPC 验证镜像层状态映射 / 红线断言 / 主链路 / 失败降级（不依赖真实 gateway）；`tests/decision_sweep_test.py` 验证批次 3 机制：waiting_decision 挂起/决策卡三按钮/approve·reject·defer 流转/限时默认策略留痕 + sweep 四类 findings 命中与幂等去重（均 mock，不发真实消息）；
+- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；`tests/setup_test.py` 验证 setup.py 骨架生成 / 幂等 / `--apply` 备份（均为临时目录虚构配置，不碰仓库 config/）；`tests/deploy_smoke_test.py` 端到端验证一键部署闭环（deploy.sh 真实执行 + 状态机全闭环 + revision 乐观锁 / waiting_retry 退避 / retry-due 幂等新机制 + feishu_card.py 卡片渲染与发送路径 mock）；`tests/mirror_test.py` 用 mock RPC 验证镜像层状态映射 / 红线断言 / 主链路 / 失败降级（不依赖真实 gateway）；`tests/decision_sweep_test.py` 验证批次 3 机制：waiting_decision 挂起/决策卡三按钮/approve·reject·defer 流转/限时默认策略留痕 + sweep findings 命中与幂等去重（均 mock，不发真实消息）；`tests/blocked_cancel_test.py` 验证批次 4 机制：blocked 挂起/看板展示/blockedTaskId/unblock 恢复 + sticky cancel 意图持久化（磁盘重读不丢）/补 spawn 拒绝/unstop 反悔 + sweep cancelled_active finding（均 mock，不发真实消息）；
 - 真实飞书卡片收发需要有效应用凭证与 open_id：未配置凭证时 `board` 等涉及卡片的命令会在发送阶段报错，属预期行为——请先按「快速上手」配置。
 
 ## 常见问题 FAQ

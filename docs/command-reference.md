@@ -41,8 +41,9 @@
 | `set-result <task_id> <结果全文> [摘要]` | 保存任务结果；若任务处于 `running` 则自动转 `review`。摘要缺省时取结果前 200 字 |
 | `complete <task_id>` | 完成任务（`running`/`review` 可完成）→ `done`。**流水线联动**：若任务属于某阶段，自动创建并启动下一阶段任务 |
 | `review <task_id>` | 仅 `running` 可提交审核 → `review`（`set-result` 已隐含该转换，此命令用于不带结果的手动提交） |
-| `stop <task_id>` | 人为停止任务（`done` 不可停止）→ `stopped`，释放占用的猴 |
-| `release <agent_id>` | 释放某只猴：其名下所有 `running` 任务置 `stopped` |
+| `stop <task_id>` | 人为停止任务（`done` 不可停止）→ `stopped`，释放占用的猴。**sticky cancel**：同时持久化取消意图（`cancel_requested` + 时间戳，重启不丢）——后续对该任务的补 spawn（retry-due 拉起 / record-run 登记）会被拒绝并提示 unstop；反悔用 `unstop` |
+| `unstop <task_id>` | **清除取消意图（用户反悔）**：stopped 任务恢复为停止前状态（`stopped_from`，缺省 `pending`；原状态为 running/review 时重新占用 agent），之后可正常补 spawn/推进 |
+| `release <agent_id>` | 释放某只猴：其名下所有 `running` 任务置 `stopped`（同样写入取消意图，行为与 stop 一致） |
 | `clear <task_id>` | 清除终态任务（仅 `done`/`error`/`stopped`），从看板移除并归档进 `history`；非终态任务会被拒绝（提示先 stop/complete） |
 
 ### 失败与重试
@@ -54,6 +55,13 @@
 | `retry-due` | **退避到期 + 决策限时扫描（sweep，幂等）**：① 把 `next_retry_at` 已到点的 `waiting_retry` 任务转回并真启动（`running`），**attempts 此时才 +1**（账实相符：账上 +1 = 真启动一次），返回 `started` 列表（含 task_id/agent_id），由协调猴对每个条目 `sessions_spawn(agentId=<agent_id>)` 拉起并 `record-run`；② 限时已到且未决策的 `waiting_decision` 任务按配置的默认策略执行（approve 恢复 / reject 终止）并留痕，返回 `decided` 列表。建议由 cron 每分钟驱动（见下方「退避重试驱动」） |
 
 > ⚠️ 重试完全由看板状态机驱动：`fail` 瞬时失败不再立即重试（不烧 attempts），而是进 `waiting_retry` 等退避到期；禁止绕过看板直接重试，否则次数与状态失真。
+
+### 卡住等输入（O8）
+
+| 命令 | 说明 |
+|---|---|
+| `block <task_id> <卡住原因> [--blocked-task-id <上游任务id>]` | 把任务挂起为 `blocked`（卡住等输入：等用户确认/等上游产物），与「失败」（`error`）明确区分：不是错误、不烧 attempts，只是需要外部输入才能继续。agent 释放不占坑；`--blocked-task-id` 可选，若卡在等上游任务产物则记来源任务 id（`blockedTaskId`）。仅非终态活动任务（running/review/pending）可挂起；`blocked` 属非终态，不可 `clear`（需先 `unblock`） |
+| `unblock <task_id>` | 解除卡住，恢复到挂起前状态（`blocked_from`：原 running/review 重新占用 agent，其余回到 `pending` 排队）继续流转 |
 
 ### 决策等待（O6）
 
@@ -70,7 +78,7 @@
 
 | 命令 | 说明 |
 |---|---|
-| `sweep [--notify]` | **audit/sweeper 完整版**：扫描台账产出四类 findings——`stale_running`（running 超阈值无进展，默认 2h，team.json `sweep.stale_running_seconds` 可配）、`pending_aged`（待分配超龄，默认 6h）、`retry_overdue`（waiting_retry 超宽限期未拉起，默认 1800s）、`ledger_no_progress`（run_id 已登记但长期无进展，子会话可能已死）。输出结构化 JSON + 人类可读摘要（stderr）；`--notify` 经 feishu_card.py 发告警卡（凭据缺失静默跳过）。**幂等**：同一 finding（type+task_id 指纹）未消除前不重复告警，sweep-state-<account>.json 记 last_notified；任务恢复后指纹自动清除，复发可再告警 |
+| `sweep [--notify]` | **audit/sweeper 完整版**：扫描台账产出五类 findings——`stale_running`（running 超阈值无进展，默认 2h，team.json `sweep.stale_running_seconds` 可配）、`pending_aged`（待分配超龄，默认 6h）、`retry_overdue`（waiting_retry 超宽限期未拉起，默认 1800s）、`ledger_no_progress`（run_id 已登记但长期无进展，子会话可能已死）、`cancelled_active`（O9：已取消但子会话疑似仍活跃——stop 且取消意图在、run_id 已登记、取消后关注窗口内（默认 2h，`sweep.cancelled_active_window_seconds` 可配）无任何后续进展，提醒人工确认子会话是否需手动终止）。输出结构化 JSON + 人类可读摘要（stderr）；`--notify` 经 feishu_card.py 发告警卡（凭据缺失静默跳过）。**幂等**：同一 finding（type+task_id 指纹）未消除前不重复告警，sweep-state-<account>.json 记 last_notified；任务恢复后指纹自动清除，复发可再告警 |
 
 #### 退避重试驱动（cron）
 
@@ -102,10 +110,14 @@ assign/start → pending → running → review → done
                            │  waiting_decision（带限时/默认策略，决策卡三按钮）
                            │  ↓ decide approve → running ｜ decide reject → stopped
                            │  ↓ decide defer → 限时顺延 ｜ 限时未决 → 按默认策略执行（留痕）
-                           ├─→ stopped（stop）
+                           │  ↓ block（卡住等输入，agent 释放，可带 blockedTaskId）
+                           │  blocked（与 error 区分：不是失败，等外部输入）
+                           │  ↓ unblock → 恢复 blocked_from（running/review/pending）
+                           ├─→ stopped（stop，同时持久化取消意图 cancel_requested）
+                           │      补 spawn（retry-due 拉起 / record-run）被拒；unstop 反悔恢复
                            ├─→ error（error / fail 非瞬时错误 / 重试耗尽）
 review → running（审核打回重派）
-done/error/stopped → clear（归档进 history）
+done/error/stopped → clear（归档进 history；blocked 非终态不可 clear，先 unblock）
 ```
 
 **并发写保护（revision 乐观锁）**：state.json 带 `revision` 字段，每次写入 +1；命令保存时若磁盘 revision 已超前（并发写抢先），本次写入被拒并自动重读重试（最多 10 次），不会互相覆盖。
@@ -171,6 +183,44 @@ python3 scripts/pipeline.py decide task-1787100000-a1b2c3 defer              # �
 
 # 3. 限时未否决：cron 驱动的 retry-due 按默认策略自动执行并留痕（decision.log）
 #    高危操作建议 --tier high（默认策略 reject，需明确批准）
+```
+
+### 工作流 1.6：卡住等输入（O8 blocked）
+
+```bash
+export BOARD_ACCOUNT=bot01
+
+# 1. 任务卡住（等用户确认/等上游产物）：挂起为 blocked（与 error 明确区分）
+#    等上游任务产物时带 --blocked-task-id 记来源任务（blockedTaskId）
+python3 scripts/pipeline.py block task-1787100000-a1b2c3 "等上游产物：接口文档" \
+    --blocked-task-id task-1787090000-up0001
+# → {"ok": true, "status": "blocked", "blockedTaskId": "task-1787090000-up0001", ...}
+# 看板显示「🚧 卡住等输入（blocked）」区：卡住原因 + 等上游任务 id；agent 已释放不占坑
+
+# 2. 输入到位：解除卡住，恢复到挂起前状态继续流转
+python3 scripts/pipeline.py unblock task-1787100000-a1b2c3
+# → {"ok": true, "status": "running", ...}
+```
+
+### 工作流 1.7：取消与反悔（O9 sticky cancel）
+
+```bash
+export BOARD_ACCOUNT=bot01
+
+# 1. 停止任务：取消意图持久化（重启不丢），堵死「停了又被拉起」
+python3 scripts/pipeline.py stop task-1787100000-a1b2c3
+# → {"ok": true, "cancel_requested": true, ...}
+
+# 2. 之后任何对该任务的补 spawn 都被拒（明确报错而非静默新建）：
+python3 scripts/pipeline.py record-run task-1787100000-a1b2c3 run-xxx
+# → {"ok": false, "cancel_requested": true,
+#    "msg": "任务已取消（sticky 意图在…），拒绝补登记 spawn；如确需继续请先 unstop …"}
+# retry-due 退避到期扫描同样拒绝拉起（cancelled 列表留痕）；
+# sweep 对取消后仍疑似活跃（有 run_id 无进展）的任务产出 cancelled_active finding
+
+# 3. 用户反悔：清除意图，恢复为停止前状态，可正常补 spawn/推进
+python3 scripts/pipeline.py unstop task-1787100000-a1b2c3
+# → {"ok": true, "had_intent": true, "restored": "running", ...}
 ```
 
 ### 工作流二：五阶段流水线

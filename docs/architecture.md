@@ -44,7 +44,9 @@ stateDiagram-v2
     running --> review: set-result（保存结果，提交审核）
     review --> done: complete（通过，自动推进流水线下一阶段）
     review --> running: 审核打回（重派）
-    running --> stopped: stop（人为停止）
+    running --> stopped: stop（人为停止，sticky：取消意图持久化，补 spawn 被拒；unstop 反悔）
+    running --> blocked: block（卡住等输入，可带 blockedTaskId）
+    blocked --> running: unblock（恢复挂起前状态）
     running --> error: error（权限/配置类错误，不重试）
     running --> pending: fail（瞬时错误，任务级退避重试，max_attempts 默认 3）
     done --> [*]
@@ -58,7 +60,8 @@ stateDiagram-v2
 | `running` | 某只角色猴正在干（已记录子会话） |
 | `review` | 干完了，结果已保存，等审核 |
 | `done` | 审核通过；若是流水线阶段任务，自动推进下一阶段 |
-| `stopped` | 人为停止 |
+| `stopped` | 人为停止；**sticky cancel**：取消意图持久化（`cancel_requested`+时间戳，重启不丢），补 spawn（retry-due 拉起 / record-run 登记）被拒并提示 unstop；`unstop` 清除意图反悔恢复 |
+| `blocked` | 卡住等输入（等用户确认/等上游产物），与 `error` 明确区分：不是失败、不烧 attempts；`blockedTaskId` 记来源上游任务；`unblock` 恢复流转 |
 | `error` | 权限/配置类失败，**不自动重试** |
 | `pending`（经 fail） | 瞬时错误，按 `max_attempts` 退避重试 |
 

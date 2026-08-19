@@ -196,6 +196,38 @@ update_params = next(p for m, p in CALLS if m == "workboard.cards.update")
 check("pipe:waiting_decision" in update_params["patch"]["labels"], "waiting_decision 带 label")
 check("workboard.cards.comment" in ms, "waiting_decision 迁移附带决策 comment")
 
+# O8：blocked（卡住等输入）→ blocked + pipe:blocked label + 原因 comment（与 waiting_decision 区分）
+# 先经 running 重置 last_synced，否则同为 blocked 目标不重复附 comment（幂等设计）
+CALLS.clear()
+set_task_status("running")
+wm.sync_task("bot01", TASK_ID)
+CALLS.clear()
+set_task_status("blocked", blocked_reason="等上游产物：接口文档",
+                blockedTaskId="task-1700000000-up0001", blocked_at="2026-08-19 15:00:00")
+wm.sync_task("bot01", TASK_ID)
+ms = methods_called()
+move_params = next(p for m, p in CALLS if m == "workboard.cards.move")
+check(move_params.get("status") == "blocked", "blocked 任务 move 到 blocked")
+update_params = next(p for m, p in CALLS if m == "workboard.cards.update")
+check("pipe:blocked" in update_params["patch"]["labels"], "blocked 带 pipe:blocked label")
+check("卡住等输入" in update_params["patch"]["notes"
+      ] and "task-1700000000-up0001" in update_params["patch"]["notes"],
+      "blocked notes 含原因与 blockedTaskId")
+check("workboard.cards.comment" in ms, "blocked 迁移附带卡住原因 comment")
+comment_params = next(p for m, p in CALLS if m == "workboard.cards.comment")
+check("卡住等输入" in comment_params.get("body", "")
+      and "task-1700000000-up0001" in comment_params.get("body", ""),
+      "blocked comment 与 waiting_decision 区分（含原因与上游任务）")
+
+# O9：取消意图在 notes 中可见（镜像层只读展示）
+CALLS.clear()
+set_task_status("stopped", cancel_requested=True,
+                cancel_requested_at="2026-08-19 15:00:00")
+wm.sync_task("bot01", TASK_ID)
+update_params = next(p for m, p in CALLS if m == "workboard.cards.update")
+check("cancel_requested 在镜像 notes 可见",
+      "cancel_requested" in update_params["patch"]["notes"])
+
 print("== 4. 失败降级与 pending_ops 补同步 ==")
 wm.subprocess.run = make_fake_run(fail=True)  # 模拟 gateway 不可达
 CALLS.clear()

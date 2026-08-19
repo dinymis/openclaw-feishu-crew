@@ -53,7 +53,7 @@ GATEWAY_TIMEOUT_MS = 5000
 # ---------------------------------------------------------------------------
 # 状态映射（设计文档 §2）
 # ---------------------------------------------------------------------------
-# pipeline 任务态 → workboard 五态（stopped/error/waiting_retry/waiting_decision → blocked + label 区分）
+# pipeline 任务态 → workboard 五态（stopped/error/waiting_retry/waiting_decision/blocked → blocked + label 区分）
 STATUS_MAP = {
     "pending": "todo",
     "running": "running",
@@ -63,6 +63,7 @@ STATUS_MAP = {
     "error": "blocked",
     "waiting_retry": "blocked",
     "waiting_decision": "blocked",
+    "blocked": "blocked",
 }
 
 # R1/R4：镜像卡只允许出现的 workboard 状态
@@ -73,7 +74,8 @@ FORBIDDEN_CARD_FIELDS = ("sessionKey", "execution", "runId")
 
 # reconcile / 首帧全量同步时主动建卡的任务状态集合（done/stopped 历史跳过，
 # 设计文档 §2 边界 / §6.1）
-ACTIVE_STATUSES = {"pending", "running", "review", "error", "waiting_retry", "waiting_decision"}
+ACTIVE_STATUSES = {"pending", "running", "review", "error", "waiting_retry",
+                   "waiting_decision", "blocked"}
 
 
 def log(msg):
@@ -260,6 +262,8 @@ def card_labels(account, task):
         labels.append("pipe:waiting_retry")
     elif status == "waiting_decision":
         labels.append("pipe:waiting_decision")
+    elif status == "blocked":
+        labels.append("pipe:blocked")
     return labels
 
 
@@ -285,6 +289,12 @@ def card_notes(task):
         lines.append(f"run_id: {task['run_id']}")
     if task.get("child_session_key"):
         lines.append(f"child_session_key: {task['child_session_key']}")
+    if task.get("blocked_reason"):
+        lines.append(f"卡住等输入: {truncate(task['blocked_reason'], 120)}")
+    if task.get("blockedTaskId"):
+        lines.append(f"等上游任务(blockedTaskId): {task['blockedTaskId']}")
+    if task.get("cancel_requested"):
+        lines.append(f"cancel_requested: true（取消于 {task.get('cancel_requested_at') or '未知'}，补 spawn 将被拒绝）")
     lines.append("—— pipeline 单向只读镜像，事实源为 task-state，请勿手工改动状态")
     return "\n".join(lines)
 
@@ -351,6 +361,12 @@ def transition_comment(task, target, last_synced):
             return (f"等待用户决策（限时 {d.get('timeout_at') or '未知'}，"
                     f"未决默认 {d.get('default_action') or '-'}）："
                     f"{truncate(d.get('question') or '（无问题描述）', 120)}")
+        if status == "blocked":
+            # O8：卡住等输入，与 error/stopped/waiting_* 的 blocked 映射用 comment 区分
+            extra = ""
+            if task.get("blockedTaskId"):
+                extra = f"（等上游任务 {task['blockedTaskId']}）"
+            return (f"卡住等输入：{truncate(task.get('blocked_reason') or '（无原因）', 120)}{extra}")
     return None
 
 

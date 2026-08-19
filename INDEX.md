@@ -44,6 +44,7 @@ openclaw gateway restart                                    # （若未带 --res
 | `tests/setup_test.py` | setup.py 一键初始化自测（骨架/幂等/--apply 备份） | 改完 setup.py 后跑通 |
 | `tests/mirror_test.py` | 镜像层自测（八态映射 + 红线断言 + mock RPC 主链路/降级） | 改完 workboard-mirror.py 后跑通 |
 | `tests/decision_sweep_test.py` | 批次 3 验收：waiting_decision 决策卡 + approve/reject/defer 流转 + sweep 四类 findings + 幂等去重 | 改完决策/巡检机制后跑通 |
+| `tests/blocked_cancel_test.py` | 批次 4 验收：blocked 挂起/看板展示/unblock 恢复 + sticky cancel 持久化/补 spawn 拒绝/unstop 反悔 + sweep cancelled_active | 改完 blocked/sticky cancel 机制后跑通 |
 | `CONTRIBUTING.md` | 贡献约定（零依赖/脱敏/提交流程） | 准备提交改动时 |
 | `CODE_OF_CONDUCT.md` / `LICENSE` | 社区准则 / MIT 许可 | 几乎不需要读 |
 

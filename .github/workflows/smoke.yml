@@ -41,3 +41,6 @@ jobs:
 
       - name: 运行批次 3 验收（O6 决策卡 + O7b 巡检）
         run: python3 tests/decision_sweep_test.py
+
+      - name: 运行批次 4 验收（O8 blocked 态 + O9 sticky cancel）
+        run: python3 tests/blocked_cancel_test.py

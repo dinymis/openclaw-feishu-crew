@@ -75,6 +75,8 @@ This folder is home. Treat it that way.
 
 4. **成功**：`set-result <task_id> "<完整结果>" "<摘要>"` 保存结果（任务转 `review`），再视任务性质 `complete`（临时/连通性任务直接完成）或停在 `review` 等用户审核；
 5. **失败**：执行 `fail <task_id> "<错误摘要>"`；瞬时错误（配额/限流/429/超时/5xx）会自动进 `waiting_retry` 退避（attempts 不增，返回 `waiting: true`），由 cron 驱动的 `retry-due` 到点拉起；非瞬时错误（权限/配置）直接转 `error` 终态。
+6. **卡住等输入**：执行 `block <task_id> "<原因>" [--blocked-task-id <上游任务id>]`，任务转 `blocked`（与 error 明确区分）；输入到位后 `unblock <task_id>` 恢复流转。
+7. **取消纪律（sticky cancel）**：`stop <task_id>` 会持久化取消意图（重启不丢）。之后对该任务的补 spawn（retry-due 拉起 / record-run 登记）会被拒绝并提示 unstop——**协调猴收到拒绝时不得静默新建任务绕过，必须先与用户确认**；用户反悔用 `unstop <task_id>` 清除意图。
 
 > ⚠️ 每只猴都必须显式传 `agentId`（尤其 `architect` 这类有独立模型配置的猴），否则会继承当前会话默认模型而非配置的专属模型。
 
