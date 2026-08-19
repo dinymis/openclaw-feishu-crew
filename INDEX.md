@@ -12,8 +12,8 @@
 
 ```bash
 git clone https://github.com/dinymis/openclaw-feishu-crew
-cd openclaw-feishu-crew && python3 scripts/setup.py   # 交互问答填昵称/appId/appSecret/open_id
-openclaw gateway restart                              # 然后对 bot 说「看板」
+cd openclaw-feishu-crew && bash scripts/deploy.sh --smoke   # 一条命令：前置检查 → setup.py → restart 提示 → 自动冒烟自验证
+openclaw gateway restart                                    # （若未带 --restart）然后对 bot 说「看板」
 ```
 
 ## 文件地图（每份文件干什么 / AI 在什么场景读）
@@ -27,6 +27,7 @@ openclaw gateway restart                              # 然后对 bot 说「看�
 | `config/README.md` | 业务配置层说明、优先级、字段含义 | 填 team.json / accounts/ 或排查配置优先级时 |
 | `config/team.json.example` | 团队配置模板（accounts 表 / 默认账号 / agents） | 新建 team.json 时参考 |
 | `config/accounts/bot01.json.example` | per-account 飞书凭证模板 | 新建某账号凭证文件时参考 |
+| `scripts/deploy.sh` | 一键部署脚本（前置检查 python3≥3.8/仓库完整性 → setup.py → restart 提示），`--smoke` 部署后自动端到端冒烟自验证 | 刚 clone 仓库、要一条命令走完部署时 |
 | `scripts/setup.py` | 一键初始化：生成配置骨架 + doctor 自检（幂等，已存在不覆盖）；`--apply` 并入 openclaw.json（先备份 .bak） | 刚 clone 仓库、从零初始化配置时 |
 | `scripts/pipeline.py` | 核心：看板状态机 + 命令层 | 理解/改动看板逻辑、扩展命令时 |
 | `scripts/doctor.py` | 一键自检（配置完整性/对齐/凭证连通性）；`--fix` 交互补全 | 部署收尾复查、诊断「为什么没生效」时 |
@@ -38,6 +39,7 @@ openclaw gateway restart                              # 然后对 bot 说「看�
 | `docs/command-reference.md` | pipeline.py 全量命令手册 + 典型工作流 | 查命令用法、环境变量、编排示例时 |
 | `docs/feishu-app-setup.md` | 飞书自建应用搭建 SOP（含踩坑） | 建飞书应用、排查 99991672 / HTTP 400 / open_id 时 |
 | `tests/smoke_test.py` | 离线冒烟：状态机闭环验收 | 改完 pipeline 后跑通验收 |
+| `tests/deploy_smoke_test.py` | 一键部署端到端冒烟（deploy.sh 闭环 + revision/waiting_retry/retry-due 新机制 + 卡片渲染 mock） | 改完 deploy.sh 或验证部署闭环后跑通 |
 | `tests/doctor_test.py` | doctor / add-engineer / --fix 自测 | 改完 doctor 或 add-engineer 后跑通 |
 | `tests/setup_test.py` | setup.py 一键初始化自测（骨架/幂等/--apply 备份） | 改完 setup.py 后跑通 |
 | `CONTRIBUTING.md` | 贡献约定（零依赖/脱敏/提交流程） | 准备提交改动时 |
@@ -59,6 +61,8 @@ python3 scripts/add-engineer.py bot03 Carole
 ## 命令速查
 
 ```bash
+bash scripts/deploy.sh --smoke          # 一键部署 + 自动冒烟自验证
+bash scripts/deploy.sh --restart        # 部署成功后自动执行 openclaw gateway restart
 python3 scripts/setup.py              # 一键初始化（生成配置骨架 + doctor 自检）
 python3 scripts/setup.py --apply      # 同上，并把账号并入 openclaw.json（先备份 .bak）
 python3 scripts/doctor.py            # 全量自检（含凭证连通性探测）
@@ -72,7 +76,7 @@ python3 scripts/pipeline.py assign <agent_id> <标题>    # 派活
 python3 scripts/pipeline.py complete <task_id>          # 完成
 python3 scripts/pipeline.py detail <task_id>            # 详情
 # 完整命令见 README「命令速查」
-python3 tests/smoke_test.py && python3 tests/doctor_test.py && python3 tests/setup_test.py
+python3 tests/deploy_smoke_test.py && python3 tests/smoke_test.py && python3 tests/doctor_test.py && python3 tests/setup_test.py
 ```
 
 ## 部署就绪判定
@@ -82,4 +86,4 @@ python3 tests/smoke_test.py && python3 tests/doctor_test.py && python3 tests/set
 1. `python3 scripts/doctor.py`（联网）全绿；
 2. `openclaw gateway restart` 成功；
 3. 对任一 bot 说「看板」能收到第一张卡片；
-4. `python3 tests/smoke_test.py`、`tests/doctor_test.py`、`tests/setup_test.py` 全绿。
+4. `python3 tests/deploy_smoke_test.py`、`tests/smoke_test.py`、`tests/doctor_test.py`、`tests/setup_test.py` 全绿。

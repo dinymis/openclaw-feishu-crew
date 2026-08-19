@@ -6,6 +6,9 @@
 > 💡 阶段 1/3 的手动拷模板与填配置可用 `python3 scripts/setup.py` 一条命令代替
 > （自动从 `*.example` 生成配置骨架 + 交互问答收集昵称/appId/appSecret/open_id + doctor 自检）；
 > 非交互/CI：`python3 scripts/setup.py --account-id bot01 --name Alice --app-id cli_xxx --app-secret *** --open-id ou_xxx`。
+>
+> 🚀 也可用一键部署脚本 `bash scripts/deploy.sh` 串联「前置检查 → setup.py → restart 提示」；
+> 部署后用 `bash scripts/deploy.sh --smoke`（或单独跑 `python3 tests/deploy_smoke_test.py`）自验证，不发真实飞书消息。
 
 ---
 
@@ -69,6 +72,8 @@
 
 ### 阶段 5：生效并验证看板
 
+> 快捷路径：部署时带 `--restart` 可自动执行 `openclaw gateway restart`（未检测到 openclaw 命令时只提示不报错）。
+
 - [ ] 执行 `openclaw gateway restart`
 - [ ] 对任一 bot（如 bot01）私聊说「看板」
 - [ ] 预期：收到第一张看板卡片（含三位工程师的看板入口 + 任务列表）
@@ -76,6 +81,7 @@
 
 ### 阶段 6：跑测试，确认仓库状态机闭环
 
+- [ ] `python3 tests/deploy_smoke_test.py` → 输出 `DEPLOY SMOKE PASS`（端到端一键部署闭环）
 - [ ] `python3 tests/smoke_test.py` → 输出 `SMOKE PASS`
 - [ ] `python3 tests/doctor_test.py` → 输出 `DOCTOR TEST PASS`
 - [ ] `python3 tests/setup_test.py` → 输出 `SETUP TEST PASS`
@@ -92,6 +98,6 @@
 - [ ] `doctor.py`（联网）全绿
 - [ ] `openclaw gateway restart` 无报错
 - [ ] 对 bot 说「看板」能收到卡片
-- [ ] 三组测试全绿（smoke / doctor / setup）
+- [ ] 四组测试全绿（deploy smoke / smoke / doctor / setup）
 
 以上全勾 = 团队可用。若中途卡住，把 `python3 scripts/doctor.py` 的输出发给用户，按 ❌ 与 FAQ 逐条解。

@@ -41,6 +41,15 @@ openclaw gateway restart   # 然后对 bot 说「看板」
 
 `setup.py` 会自动从 `*.example` 生成配置骨架（`config/team.json`、`config/accounts/<account_id>.json`，已存在的保留不覆盖），交互问答收集昵称 / `app_id` / `app_secret` / `open_id`，并收尾跑 doctor 自检、列出待补项。
 
+也可以用一键部署脚本把上面三步串成一条命令（前置检查 python3 ≥3.8 / 仓库完整性 → setup.py → 提示/执行 `openclaw gateway restart`），`--smoke` 还能自动跑端到端冒烟自验证：
+
+```bash
+bash scripts/deploy.sh --smoke          # 部署 + 自动冒烟（不发真实飞书消息）
+bash scripts/deploy.sh --restart        # setup 成功后自动 openclaw gateway restart
+bash scripts/deploy.sh --offline --account-id bot01 --name Alice \
+  --app-id cli_xxx --app-secret ***   # 非交互/CI（参数透传给 setup.py）
+```
+
 <details>
 <summary><b>高级：分步手动配置（setup.py 做的事拆开看）</b></summary>
 
@@ -71,6 +80,10 @@ python3 scripts/setup.py --offline    # 可选：跳过 doctor 联网探测
 ## 命令速查
 
 ```bash
+# 一键部署（clone 后一条命令：前置检查 → setup.py → restart 提示；--smoke 自动冒烟自验证）
+bash scripts/deploy.sh --smoke
+bash scripts/deploy.sh --restart        # setup 成功后自动执行 openclaw gateway restart
+
 # 一键初始化（clone 后第一条命令；幂等，已存在的配置保留不覆盖）
 python3 scripts/setup.py              # 交互问答：昵称/appId/appSecret/open_id
 python3 scripts/setup.py --apply      # 同上，并把账号自动并入 openclaw.json（先备份 .bak）
@@ -120,7 +133,7 @@ BOARD_ACCOUNT=bot01 python3 scripts/feishu_card.py --update <message_id> ['{"sta
 
 ## 冒烟验收边界
 
-- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；`tests/setup_test.py` 验证 setup.py 骨架生成 / 幂等 / `--apply` 备份（均为临时目录虚构配置，不碰仓库 config/）；`tests/mirror_test.py` 用 mock RPC 验证镜像层状态映射 / 红线断言 / 主链路 / 失败降级（不依赖真实 gateway）；
+- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；`tests/setup_test.py` 验证 setup.py 骨架生成 / 幂等 / `--apply` 备份（均为临时目录虚构配置，不碰仓库 config/）；`tests/deploy_smoke_test.py` 端到端验证一键部署闭环（deploy.sh 真实执行 + 状态机全闭环 + revision 乐观锁 / waiting_retry 退避 / retry-due 幂等新机制 + feishu_card.py 卡片渲染与发送路径 mock）；`tests/mirror_test.py` 用 mock RPC 验证镜像层状态映射 / 红线断言 / 主链路 / 失败降级（不依赖真实 gateway）；
 - 真实飞书卡片收发需要有效应用凭证与 open_id：未配置凭证时 `board` 等涉及卡片的命令会在发送阶段报错，属预期行为——请先按「快速上手」配置。
 
 ## 常见问题 FAQ
@@ -147,6 +160,7 @@ openclaw-feishu-crew/
 ├── .gitignore                 # 真实凭证/看板状态不入库
 ├── openclaw.example.json      # OpenClaw 多 agent + 多账号配置模板
 ├── scripts/
+│   ├── deploy.sh              # 一键部署（前置检查 → setup.py → restart 提示，--smoke 自验证）
 │   ├── setup.py               # 一键初始化（生成配置骨架 + doctor 自检，幂等）
 │   ├── pipeline.py            # 核心：看板状态机 + 命令层（配置分层版）
 │   ├── workboard-mirror.py    # 可选：pipeline → Workboard 单向镜像层
@@ -168,6 +182,7 @@ openclaw-feishu-crew/
 ├── projects.example.json      # 项目登记模板（虚构 demo-shop）
 └── tests/
     ├── smoke_test.py          # 离线冒烟：状态机闭环验收
+    ├── deploy_smoke_test.py   # 一键部署端到端冒烟（deploy.sh 闭环 + 新机制 + 卡片渲染）
     ├── doctor_test.py         # doctor / add-engineer / --fix 自测
     ├── setup_test.py          # setup.py 一键初始化自测（骨架/幂等/--apply 备份）
     └── mirror_test.py         # 镜像层自测（状态映射 + mock RPC，不依赖真实 gateway）
