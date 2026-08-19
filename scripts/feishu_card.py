@@ -265,6 +265,114 @@ def build_dashboard_card(agents, pipeline_state=None):
     return card
 
 
+def decision_card_config():
+    """O6：决策卡文案配置（team.json decision_card 段，脱敏可定制）。"""
+    return TEAM.get("decision_card") or {}
+
+
+def build_decision_card(info):
+    """O6：渲染决策卡（批准/否决/转交三按钮，schema 2.0，文案全配置化）。
+
+    info 字段：task_id / title / question / options / tier_label /
+               timeout_at / default_action。
+    档位文案与按钮文字均可经 team.json decision_card 段覆盖。
+    """
+    cfg = decision_card_config()
+    header_tpl = cfg.get("header_title") or "🗳️ 任务决策待批"
+    approve_text = cfg.get("approve_button") or "✅ 批准"
+    reject_text = cfg.get("reject_button") or "❌ 否决"
+    defer_text = cfg.get("defer_button") or "↔️ 转交"
+
+    task_id = info.get("task_id") or ""
+    content = [
+        f"**任务** {info.get('title') or task_id}",
+        f"**任务 ID** `{task_id}`",
+    ]
+    if info.get("tier_label"):
+        content.append(f"**档位** {info['tier_label']}")
+    content.append(f"**问题** {info.get('question') or '（待补充）'}")
+    for i, opt in enumerate(info.get("options") or [], 1):
+        content.append(f"   选项{i}：{opt}")
+    content.append(f"**限时** {info.get('timeout_at') or '未设置'} · 未否决按默认策略"
+                   f" **{info.get('default_action') or 'approve'}** 执行")
+
+    return {
+        "schema": "2.0",
+        "config": {"width_mode": "fill", "update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": header_tpl},
+            "template": "orange",
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "\n".join(content)},
+                {"tag": "hr"},
+                {
+                    "tag": "column_set",
+                    "flex_mode": "none",
+                    "background_style": "default",
+                    "columns": [
+                        {"tag": "column", "width": "weighted", "weight": 1, "elements": [
+                            make_button(approve_text, "primary",
+                                        f"!decide {task_id} approve"),
+                        ]},
+                        {"tag": "column", "width": "weighted", "weight": 1, "elements": [
+                            make_button(reject_text, "danger",
+                                        f"!decide {task_id} reject"),
+                        ]},
+                        {"tag": "column", "width": "weighted", "weight": 1, "elements": [
+                            make_button(defer_text, "default",
+                                        f"!decide {task_id} defer"),
+                        ]},
+                    ],
+                },
+            ]
+        },
+    }
+
+
+def build_alert_card(info):
+    """O7b：渲染巡检告警卡（sweep findings 摘要，文案可配置）。
+
+    info 字段：account / engineer / findings / generated_at。
+    """
+    cfg = TEAM.get("alert_card") or {}
+    header_tpl = cfg.get("header_title") or "🚨 流水线巡检告警"
+    findings = info.get("findings") or []
+    lines = [
+        f"**账号** {info.get('account') or '-'}（{info.get('engineer') or '-'}）",
+        f"**发现异常** {len(findings)} 项 · 生成于 {info.get('generated_at') or '-'}",
+    ]
+    type_labels = {
+        "stale_running": "卡死",
+        "pending_aged": "待分配超龄",
+        "retry_overdue": "重试超期",
+        "ledger_no_progress": "有账无进展",
+    }
+    for f in findings[:10]:
+        lines.append(
+            f"• **{type_labels.get(f.get('type'), f.get('type'))}** "
+            f"`{f.get('task_id')}`（{f.get('status')}/{f.get('agent')}）· {f.get('detail')}")
+    if len(findings) > 10:
+        lines.append(f"… 其余 {len(findings) - 10} 项见 sweep JSON 输出")
+
+    return {
+        "schema": "2.0",
+        "config": {"width_mode": "fill", "update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": header_tpl},
+            "template": "red",
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "\n".join(lines)},
+                {"tag": "hr"},
+                make_button("🔄 刷新看板", "default", "!board"),
+            ]
+        },
+    }
+
+
 def _post_json(url, payload, token, method=None):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(

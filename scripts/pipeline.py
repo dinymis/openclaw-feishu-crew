@@ -5,7 +5,7 @@ Supports both full pipeline tasks (4 stages) and ad-hoc assignments
 to individual agents. Each agent can hold one task at a time.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 import fcntl
 import json
@@ -31,6 +31,24 @@ REVISION_MAX_RETRIES = 10
 # 瞬时错误失败后进入 waiting_retry 状态的默认退避时长（秒），
 # 可由 team.json 的 retry_backoff_seconds 覆盖。
 DEFAULT_RETRY_BACKOFF_SECONDS = 1800
+
+# --- O6 决策等待参数 ------------------------------------------------------
+# waiting_decision 限时（秒），到期未否决按默认策略执行；team.json
+# decision.timeout_seconds 可配。默认 24h。
+DEFAULT_DECISION_TIMEOUT_SECONDS = 86400
+# 限时未决的默认策略：approve=按批准执行 / reject=按否决终止。
+# team.json decision.default_action 可配。
+DEFAULT_DECISION_DEFAULT_ACTION = "approve"
+
+# --- O7b 巡检（sweep）参数 -------------------------------------------------
+# running 超过该时长无任何进展（record-run/set-result 等）→ stale 告警；
+# team.json sweep.stale_running_seconds 可配，默认 2h。
+DEFAULT_SWEEP_STALE_RUNNING_SECONDS = 7200
+# pending 超龄阈值（秒）；team.json sweep.pending_age_seconds 可配，默认 6h。
+DEFAULT_SWEEP_PENDING_AGE_SECONDS = 21600
+# waiting_retry 超过 next_retry_at 多久仍未被 retry-due 拉起视为异常（秒）；
+# team.json sweep.waiting_retry_grace_seconds 可配，默认 1800。
+DEFAULT_SWEEP_WAITING_RETRY_GRACE_SECONDS = 1800
 
 # O2：瞬时错误关键词（fail 命令自动检测，命中 → waiting_retry 退避，
 # 不烧 attempts；未命中视为权限/配置类错误 → error 终态不重试）。
@@ -177,6 +195,7 @@ STATUS_ICON = {
     "error": "❌",
     "idle": "⏸",
     "waiting_retry": "⏰",
+    "waiting_decision": "🗳️",
 }
 
 STATUS_LABEL = {
@@ -188,6 +207,7 @@ STATUS_LABEL = {
     "error": "失败",
     "idle": "空闲",
     "waiting_retry": "等待重试",
+    "waiting_decision": "等待决策",
 }
 
 
@@ -280,6 +300,7 @@ def normalize_task(task):
     task.setdefault("run_id", "")
     task.setdefault("child_session_key", "")
     task.setdefault("next_retry_at", None)
+    task.setdefault("last_activity_at", None)
     return task
 
 
@@ -588,6 +609,7 @@ def start_task_assignment(state, task_id):
     assign_agent(state, agent_id, task_id)
     task["status"] = "running"
     task["started_at"] = now()
+    task["last_activity_at"] = now()
     task["attempts"] = int(task.get("attempts") or 0) + 1
     task["last_error"] = ""
     return True, None
@@ -717,6 +739,7 @@ def set_task_result(task_id, result_text, summary=None):
         return {"ok": False, "msg": "任务不存在"}
     task["result"] = result_text
     task["summary"] = summary or result_text[:200].strip()
+    task["last_activity_at"] = now()
     if task["status"] == "running":
         task["status"] = "review"
     save_state(state)
@@ -735,6 +758,7 @@ def record_task_run(task_id, run_id=None, child_session_key=None):
         task["run_id"] = run_id
     if child_session_key:
         task["child_session_key"] = child_session_key
+    task["last_activity_at"] = now()
     save_state(state)
     _trigger_workboard_mirror([task_id])
     update_board(state)
@@ -744,6 +768,290 @@ def record_task_run(task_id, run_id=None, child_session_key=None):
 def retry_backoff_seconds():
     """O2：瞬时错误退避时长（秒），team.json retry_backoff_seconds 可配，默认 1800。"""
     return int(TEAM.get("retry_backoff_seconds") or DEFAULT_RETRY_BACKOFF_SECONDS)
+
+
+# --- O6 waiting_decision 决策等待 -----------------------------------------
+# 任务等用户决策时挂起为 waiting_decision（复用 waiting 基础设施思路，
+# kind=user_decision）：带决策元数据（问题/选项/档位/限时/默认策略）。
+# 决策卡统一经 scripts/feishu_card.py 通道发送（批准/否决/转交三按钮，
+# 档位文案全部配置化：team.json decision.tiers / decision_card 段，脱敏）。
+# 用户拍板入口：pipeline.py decide <task_id> approve|reject|defer
+# （卡片回调与手工命令共用）。限时未否决按默认策略执行并留痕，
+# 到期执行由 retry-due（现有每分钟 cron）驱动。
+
+DECISION_ACTIONS = ("approve", "reject", "defer")
+
+# 允许挂起等待决策的来源状态（非终态活动任务）。
+DECISION_SUSPENDABLE_STATUS = ("running", "review", "pending")
+
+
+def decision_config():
+    return TEAM.get("decision") or {}
+
+
+def decision_timeout_seconds():
+    return int(decision_config().get("timeout_seconds") or DEFAULT_DECISION_TIMEOUT_SECONDS)
+
+
+def decision_default_action():
+    action = decision_config().get("default_action") or DEFAULT_DECISION_DEFAULT_ACTION
+    return action if action in ("approve", "reject") else DEFAULT_DECISION_DEFAULT_ACTION
+
+
+def decision_tiers():
+    """决策档位表：代码内为通用默认文案，team.json decision.tiers 可全量覆盖。
+
+    档位语义与决策分级清单对齐：低危可逆默认可批、高危默认否决（需明确批准）。
+    文案不含任何内部标识，可按部署环境自由定制。
+    """
+    defaults = {
+        "low": {
+            "label": "低危可逆 · 默认批准",
+            "default_action": "approve",
+            "timeout_seconds": 3600,
+        },
+        "medium": {
+            "label": "中危 · 限时未否决按默认策略执行",
+            "default_action": "approve",
+            "timeout_seconds": DEFAULT_DECISION_TIMEOUT_SECONDS,
+        },
+        "high": {
+            "label": "高危 · 默认否决（需明确批准）",
+            "default_action": "reject",
+            "timeout_seconds": DEFAULT_DECISION_TIMEOUT_SECONDS,
+        },
+    }
+    overrides = decision_config().get("tiers") or {}
+    merged = {}
+    for key, info in defaults.items():
+        item = dict(info)
+        item.update(overrides.get(key) or {})
+        merged[key] = item
+    return merged
+
+
+def _parse_ts(ts):
+    """解析 '%Y-%m-%d %H:%M:%S' 时间串为 epoch 秒；非法/空返回 None。"""
+    if not ts:
+        return None
+    try:
+        return time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _send_decision_card(task):
+    """O6：决策卡经 feishu_card.py 通道发送（批准/否决/转交三按钮）。
+
+    凭据或收件人 open_id 缺失时静默跳过（返回 None），绝不阻塞主流程；
+    发送成功返回卡片 message_id（记入决策元数据供后续更新）。
+    """
+    try:
+        real_dir = os.path.dirname(os.path.realpath(__file__))
+        if real_dir not in sys.path:
+            sys.path.insert(0, real_dir)
+        import feishu_card
+        open_id = feishu_card.resolve_open_id(None)
+        if not open_id:
+            return None
+        token = feishu_card.get_token()
+        d = task.get("decision") or {}
+        tier_label = decision_tiers().get(d.get("tier") or "", {}).get("label", "")
+        card = feishu_card.build_decision_card({
+            "task_id": task["id"],
+            "title": task.get("title") or task["id"],
+            "question": d.get("question") or "",
+            "options": d.get("options") or [],
+            "tier_label": tier_label,
+            "timeout_at": d.get("timeout_at") or "",
+            "default_action": d.get("default_action") or decision_default_action(),
+        })
+        result = feishu_card.send_card(open_id, card, token)
+        if isinstance(result, dict) and result.get("code") == 0:
+            return (result.get("data") or {}).get("message_id")
+        return None
+    except Exception:
+        # 凭据缺失/网络异常：静默降级，决策状态已在台账生效，卡片可后补
+        return None
+
+
+def _record_decision_card_id(task_id, message_id):
+    """决策卡发送成功后补记 message_id（O1：自带冲突重读重试）。"""
+    for _ in range(REVISION_MAX_RETRIES):
+        state = load_state()
+        task = state["tasks"].get(task_id)
+        if not task:
+            return
+        d = task.setdefault("decision", {})
+        if d.get("card_message_id") == message_id:
+            return
+        d["card_message_id"] = message_id
+        try:
+            save_state(state)
+            return
+        except RevisionConflictError:
+            continue
+
+
+@revision_retry
+def request_decision(task_id, question, options=None, tier=None,
+                     default_action=None, timeout_seconds=None):
+    """O6：把任务挂起为 waiting_decision，等待用户决策。
+
+    决策元数据（问题/选项/档位/限时/默认策略）写入 task["decision"]；
+    优先级：显式参数 > 档位默认 > team.json decision 全局默认。
+    挂起后 agent 释放（不占坑），并行线不互相阻塞；决策卡经
+    feishu_card.py 发送，凭据缺失静默跳过不报错。
+    """
+    state = load_state()
+    task = state["tasks"].get(task_id)
+    if not task:
+        return {"ok": False, "msg": "任务不存在"}
+    if task["status"] not in DECISION_SUSPENDABLE_STATUS:
+        return {"ok": False,
+                "msg": f"当前状态 {task['status']} 不可挂起等待决策"
+                       f"（仅 {'/'.join(DECISION_SUSPENDABLE_STATUS)}）"}
+
+    tiers = decision_tiers()
+    tier_info = tiers.get(tier or "", {}) if tier else {}
+    if tier and not tier_info:
+        return {"ok": False, "msg": f"未知决策档位：{tier}（可选 {'/'.join(tiers)}）"}
+
+    timeout = int(timeout_seconds or tier_info.get("timeout_seconds")
+                  or decision_timeout_seconds())
+    action = default_action or tier_info.get("default_action") or decision_default_action()
+    if action not in ("approve", "reject"):
+        return {"ok": False, "msg": f"默认策略只能是 approve/reject，收到：{action}"}
+
+    release_agent(state, task["agent"])
+    prev_status = task["status"]
+    task["status"] = "waiting_decision"
+    timeout_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + timeout))
+    task["decision"] = {
+        "kind": "user_decision",
+        "question": question,
+        "options": list(options or []),
+        "tier": tier or "",
+        "tier_label": tier_info.get("label", ""),
+        "requested_at": now(),
+        "timeout_at": timeout_at,
+        "timeout_seconds": timeout,
+        "default_action": action,
+        "prev_status": prev_status,
+        "status": "waiting",
+        "card_message_id": None,
+        "log": [],
+    }
+    task["summary"] = f"等待用户决策：{question[:80]}（限时 {timeout_at}）"
+    save_state(state)
+    _trigger_workboard_mirror(
+        [task_id], comment=f"挂起等待决策：{question[:80]}（限时 {timeout_at}）")
+    update_board(state)
+
+    # 决策卡发送：失败/无凭据静默，不影响挂起结果
+    card_message_id = _send_decision_card(task)
+    if card_message_id:
+        _record_decision_card_id(task_id, card_message_id)
+
+    return {
+        "ok": True,
+        "waiting": True,
+        "task_id": task_id,
+        "status": "waiting_decision",
+        "timeout_at": timeout_at,
+        "default_action": action,
+        "card_sent": bool(card_message_id),
+        "msg": (f"任务已挂起等待决策（限时 {timeout_at}，未否决默认 {action}）："
+                f"{task['title']}"),
+    }
+
+
+def _apply_decision(state, task, action, source, note=""):
+    """O6：把决策结果应用到任务（approve 恢复执行 / reject 终止），留痕到决策记录。"""
+    d = task.setdefault("decision", {})
+    ts = now()
+    d.setdefault("log", []).append(
+        {"ts": ts, "action": action, "source": source, "note": note})
+    d["resolved_at"] = ts
+    d["resolution"] = f"{action}（{source}）"
+    d["status"] = "resolved"
+    if action == "approve":
+        task["status"] = "running"
+        task["completed_at"] = None
+        task["last_activity_at"] = ts
+        assign_agent(state, task["agent"], task["id"])
+        task["summary"] = f"决策批准（{source}），恢复执行"
+    else:  # reject
+        release_agent(state, task["agent"])
+        task["status"] = "stopped"
+        task["completed_at"] = ts
+        task["summary"] = f"决策否决（{source}），任务终止"
+
+
+@revision_retry
+def decide_task(task_id, action, source="cli"):
+    """O6：用户拍板入口（卡片回调与手工命令共用）。
+
+    approve → 恢复 running（重新占用 agent）；reject → stopped 终态；
+    defer → 保持 waiting_decision，限时顺延一个周期并留痕（转交他人处理）。
+    决策记录全部写入 task["decision"]["log"]。
+    """
+    state = load_state()
+    task = state["tasks"].get(task_id)
+    if not task:
+        return {"ok": False, "msg": "任务不存在"}
+    if task["status"] != "waiting_decision":
+        return {"ok": False,
+                "msg": f"任务不在等待决策状态（当前：{task['status']}），无法 decide"}
+    if action not in DECISION_ACTIONS:
+        return {"ok": False, "msg": f"未知决策动作：{action}（可选 {'/'.join(DECISION_ACTIONS)}）"}
+
+    d = task.get("decision") or {}
+    if action == "defer":
+        # 转交/顺延：保持挂起，限时顺延一个周期，留痕
+        timeout = int(d.get("timeout_seconds") or decision_timeout_seconds())
+        new_timeout_at = time.strftime("%Y-%m-%d %H:%M:%S",
+                                       time.localtime(time.time() + timeout))
+        d.setdefault("log", []).append(
+            {"ts": now(), "action": "defer", "source": source,
+             "note": f"转交/顺延，限时更新为 {new_timeout_at}"})
+        d["timeout_at"] = new_timeout_at
+        d["status"] = "deferred"
+        task["decision"] = d
+        task["summary"] = f"决策已转交，限时顺延至 {new_timeout_at}"
+        save_state(state)
+        _trigger_workboard_mirror([task_id], comment=f"决策转交（{source}），限时顺延至 {new_timeout_at}")
+        update_board(state)
+        return {"ok": True, "waiting": True, "task_id": task_id,
+                "action": "defer", "timeout_at": new_timeout_at,
+                "msg": f"决策已转交，限时顺延至 {new_timeout_at}：{task['title']}"}
+
+    _apply_decision(state, task, action, source)
+    save_state(state)
+    _trigger_workboard_mirror([task_id], comment=f"决策 {action}（{source}）")
+    update_board(state)
+    return {
+        "ok": True,
+        "waiting": False,
+        "task_id": task_id,
+        "action": action,
+        "status": task["status"],
+        "agent_id": task["agent"],
+        "msg": f"决策已生效（{action}/{source}）：{task['title']}",
+    }
+
+
+def _collect_expired_decisions(state):
+    """O6：找出限时已到且仍未决策的 waiting_decision 任务。"""
+    now_ts = time.time()
+    expired = []
+    for task in state["tasks"].values():
+        if task.get("status") != "waiting_decision":
+            continue
+        timeout_at = _parse_ts((task.get("decision") or {}).get("timeout_at"))
+        if timeout_at is not None and now_ts >= timeout_at:
+            expired.append(task)
+    return expired
 
 
 def is_transient_error(error_text):
@@ -850,21 +1158,24 @@ def fail_task(task_id, error_text):
 
 @revision_retry
 def retry_due_tasks():
-    """O2：扫描到点的 waiting_retry 任务并真启动（sweep，幂等）。
+    """O2/O6：扫描到点任务并执行（sweep，幂等）。
 
-    驱动端由 cron 定期调用（如每分钟）。仅当 next_retry_at <= 当前时间
-    时启动：任务转 running，attempts 此时才 +1（账实相符：账上 +1
-    即代表真启动了一次）。返回本次启动的任务列表，由协调猴/调用方
-    负责 sessions_spawn 拉起子会话。幂等：未到点/无 waiting 任务时
-    返回空列表，不写状态。
+    驱动端由 cron 定期调用（如每分钟）。两类到期动作：
+    1. O2：waiting_retry 且 next_retry_at <= 当前时间 → 真启动，
+       attempts 此时才 +1（账实相符：账上 +1 即代表真启动了一次）；
+    2. O6：waiting_decision 限时已到且未决策 → 按配置的默认策略
+       执行（approve 恢复 / reject 终止）并留痕到决策记录。
+    返回本次启动/决策的任务列表，由协调猴/调用方负责后续动作。
+    幂等：无到点任务时返回空列表，不写状态。
     """
     state = load_state()
     now_str = now()
     due = [t for t in state["tasks"].values()
            if t.get("status") == "waiting_retry"
            and (t.get("next_retry_at") or "") <= now_str]
-    if not due:
-        return {"ok": True, "started": [], "msg": "无到点重试任务"}
+    expired_decisions = _collect_expired_decisions(state)
+    if not due and not expired_decisions:
+        return {"ok": True, "started": [], "decided": [], "msg": "无到点重试/决策任务"}
 
     started = []
     for task in sorted(due, key=lambda x: x.get("next_retry_at") or ""):
@@ -882,14 +1193,26 @@ def retry_due_tasks():
             # 启动失败（理论上不应发生）：回退等待下个周期再扫
             task["status"] = "waiting_retry"
             task["next_retry_at"] = now_str
+
+    decided = []
+    for task in sorted(expired_decisions, key=lambda x: (x.get("decision") or {}).get("timeout_at") or ""):
+        action = (task.get("decision") or {}).get("default_action") or decision_default_action()
+        _apply_decision(state, task, action, "timeout-default",
+                        note=f"限时未否决，按默认策略 {action} 执行")
+        decided.append({"task_id": task["id"], "action": action,
+                        "status": task["status"], "agent_id": task["agent"]})
+
     save_state(state)
-    _trigger_workboard_mirror([s["task_id"] for s in started])
+    _trigger_workboard_mirror([s["task_id"] for s in started] +
+                              [d["task_id"] for d in decided])
     update_board(state)
     return {
         "ok": True,
         "retry": bool(started),
         "started": started,
-        "msg": f"已启动 {len(started)} 个退避到期任务",
+        "decided": decided,
+        "msg": (f"已启动 {len(started)} 个退避到期任务，"
+                f"已按默认策略决策 {len(decided)} 个限时任务"),
     }
 
 
@@ -927,6 +1250,200 @@ def error_task(task_id, error_text):
 
 
 CLEARABLE_STATUS = ("done", "error", "stopped")
+
+
+# --- O7b audit/sweeper 完整版 ---------------------------------------------
+# pipeline.py sweep：巡检四类异常 findings：
+#   1. stale_running      running 超阈值无任何进展（last_activity_at/started_at）
+#   2. pending_aged       pending 超龄未分配
+#   3. retry_overdue      waiting_retry 超过 next_retry_at+宽限仍未被拉起
+#   4. ledger_no_progress 有账无会话：run_id 已登记但长期无状态变化
+# findings 输出结构化 JSON + 人类可读摘要；--notify 经 feishu_card.py 发
+# 告警卡（凭据缺失静默跳过）；幂等：同一 finding（type+task_id 指纹）
+# 已告警过且未消除前不重复告警（sweep-state 记 last_notified 指纹）。
+
+def sweep_config():
+    return TEAM.get("sweep") or {}
+
+
+def sweep_stale_running_seconds():
+    return int(sweep_config().get("stale_running_seconds")
+               or DEFAULT_SWEEP_STALE_RUNNING_SECONDS)
+
+
+def sweep_pending_age_seconds():
+    return int(sweep_config().get("pending_age_seconds")
+               or DEFAULT_SWEEP_PENDING_AGE_SECONDS)
+
+
+def sweep_waiting_retry_grace_seconds():
+    return int(sweep_config().get("waiting_retry_grace_seconds")
+               or DEFAULT_SWEEP_WAITING_RETRY_GRACE_SECONDS)
+
+
+def sweep_state_path():
+    """O7b：巡检告警去重状态文件（与 task-state 同目录，按账号隔离）。"""
+    return os.path.join(os.path.dirname(state_file()),
+                        f"sweep-state-{CURRENT_ACCOUNT}.json")
+
+
+def load_sweep_state():
+    blank = {"version": 1, "account": CURRENT_ACCOUNT, "notified": {}}
+    try:
+        with open(sweep_state_path()) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return blank
+        data.setdefault("notified", {})
+        return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return blank
+
+
+def save_sweep_state(sweep_state):
+    path = sweep_state_path()
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(sweep_state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _task_progress_ts(task):
+    """任务最近一次进展时间（epoch 秒）：last_activity_at 优先，回退 started_at/created_at。"""
+    for key in ("last_activity_at", "started_at", "created_at"):
+        ts = _parse_ts(task.get(key))
+        if ts is not None:
+            return ts
+    return None
+
+
+def collect_findings(state, now_ts=None):
+    """O7b：扫描台账产出四类 findings（纯计算，不改台账）。"""
+    now_ts = now_ts if now_ts is not None else time.time()
+    stale_s = sweep_stale_running_seconds()
+    pending_s = sweep_pending_age_seconds()
+    grace_s = sweep_waiting_retry_grace_seconds()
+    findings = []
+
+    def add(ftype, task, detail, age):
+        findings.append({
+            "type": ftype,
+            "task_id": task["id"],
+            "title": task.get("title") or "",
+            "status": task.get("status"),
+            "agent": task.get("agent") or "",
+            "detail": detail,
+            "age_seconds": int(age),
+            "fingerprint": f"{ftype}:{task['id']}",
+        })
+
+    for task in state.get("tasks", {}).values():
+        status = task.get("status")
+        if status == "running":
+            ts = _task_progress_ts(task)
+            age = now_ts - ts if ts else 0
+            if task.get("run_id"):
+                # 有账（run_id 已登记）无会话进展：子会话可能已死
+                if age >= stale_s:
+                    add("ledger_no_progress", task,
+                        f"run_id 已登记但 {int(age // 3600)}h{(int(age % 3600)) // 60}m 无进展，子会话可能已死",
+                        age)
+            elif age >= stale_s:
+                add("stale_running", task,
+                    f"running 超阈值 {stale_s}s 无 record-run/set-result 进展",
+                    age)
+        elif status == "pending":
+            ts = _parse_ts(task.get("created_at"))
+            age = now_ts - ts if ts else 0
+            if age >= pending_s:
+                add("pending_aged", task,
+                    f"pending 超龄 {int(age // 3600)}h{int(age % 3600) // 60}m 未分配",
+                    age)
+        elif status == "waiting_retry":
+            due_ts = _parse_ts(task.get("next_retry_at"))
+            if due_ts is not None and now_ts >= due_ts + grace_s:
+                add("retry_overdue", task,
+                    f"next_retry_at={task.get('next_retry_at')} 已过宽限期仍未被 retry-due 拉起",
+                    now_ts - due_ts)
+    return findings
+
+
+def _send_sweep_alert_card(findings):
+    """O7b：巡检告警卡经 feishu_card.py 发送；凭据/收件人缺失静默返回 False。"""
+    try:
+        real_dir = os.path.dirname(os.path.realpath(__file__))
+        if real_dir not in sys.path:
+            sys.path.insert(0, real_dir)
+        import feishu_card
+        open_id = feishu_card.resolve_open_id(None)
+        if not open_id:
+            return False
+        token = feishu_card.get_token()
+        card = feishu_card.build_alert_card({
+            "account": CURRENT_ACCOUNT,
+            "engineer": engineer_name(),
+            "findings": findings,
+            "generated_at": now(),
+        })
+        result = feishu_card.send_card(open_id, card, token)
+        return isinstance(result, dict) and result.get("code") == 0
+    except Exception:
+        return False
+
+
+def sweep_tasks(notify=False, now_ts=None):
+    """O7b：巡检命令入口。返回结构化 findings + 人类可读摘要。
+
+    幂等去重：sweep-state 记录已告警指纹（type+task_id）与 last_notified；
+    同一 finding 未消除前不重复告警；任务恢复正常（不再命中）后自动清除
+    指纹，下次再犯可重新告警。
+    """
+    state = load_state()
+    findings = collect_findings(state, now_ts=now_ts)
+    sweep_state = load_sweep_state()
+    notified = sweep_state.get("notified", {})
+
+    # 清理已消除的指纹（任务不再命中），保证复发可再告警
+    current_fps = {f["fingerprint"] for f in findings}
+    for fp in list(notified.keys()):
+        if fp not in current_fps:
+            del notified[fp]
+
+    new_findings = [f for f in findings if f["fingerprint"] not in notified]
+    notified_sent = False
+    if notify and new_findings:
+        notified_sent = _send_sweep_alert_card(new_findings)
+        if notified_sent:
+            for f in new_findings:
+                notified[f["fingerprint"]] = {
+                    "task_id": f["task_id"],
+                    "type": f["type"],
+                    "last_notified": now(),
+                }
+    elif notify and not new_findings:
+        # 有存量 finding 但均已告警过：幂等不重复发
+        notified_sent = False
+    sweep_state["notified"] = notified
+    save_sweep_state(sweep_state)
+
+    # 人类可读摘要
+    summary_lines = [f"[sweep account={CURRENT_ACCOUNT}] findings={len(findings)} 新增待告警={len(new_findings)}"]
+    for f in findings:
+        marker = "新" if f["fingerprint"] in {nf["fingerprint"] for nf in new_findings} else "已告警"
+        summary_lines.append(
+            f"  [{f['type']}] {f['task_id']} ({f['status']}/{f['agent']}) {f['detail']} [{marker}]")
+    if not findings:
+        summary_lines.append("  无异常，台账健康")
+
+    return {
+        "ok": True,
+        "account": CURRENT_ACCOUNT,
+        "findings": findings,
+        "new_findings": new_findings,
+        "notified": notified_sent,
+        "summary": "\n".join(summary_lines),
+    }
+
 
 
 @revision_retry
@@ -1003,12 +1520,14 @@ def build_board(state):
 
     # Active tasks (overview only: short titles, capped at BOARD_SECTION_LIMIT)
     active = [t for t in state["tasks"].values()
-              if t["status"] in ("running", "review", "pending", "error", "waiting_retry")]
+              if t["status"] in ("running", "review", "pending", "error",
+                                 "waiting_retry", "waiting_decision")]
     running = [t for t in active if t["status"] == "running"]
     review = [t for t in active if t["status"] == "review"]
     pending = [t for t in active if t["status"] == "pending"]
     errors = [t for t in active if t["status"] == "error"]
     waiting = [t for t in active if t["status"] == "waiting_retry"]
+    decisions = [t for t in active if t["status"] == "waiting_decision"]
 
     def render_section(title, tasks, key=None, with_id=False):
         lines.append(f"\n**{title}**")
@@ -1040,8 +1559,28 @@ def build_board(state):
         if len(tasks) > BOARD_SECTION_LIMIT:
             lines.append(f"… 共 {len(tasks)} 条")
 
+    def render_decision_section(tasks):
+        """O6：waiting_decision 待决事项区，显示问题摘要与限时。"""
+        lines.append("\n**🗳️ 待决事项（等待用户决策）**")
+        if not tasks:
+            lines.append("无")
+            return
+        shown = sorted(
+            tasks,
+            key=lambda x: (x.get("decision") or {}).get("timeout_at") or "")[:BOARD_SECTION_LIMIT]
+        for t in shown:
+            icon = AGENTS[t["agent"]]["icon"]
+            d = t.get("decision") or {}
+            lines.append(
+                f"{icon} {brief(t['title'])} · `{t['id']}`"
+                f" · 限时 {d.get('timeout_at') or '未知'}"
+                f" · 未决默认 {d.get('default_action') or '-'}")
+        if len(tasks) > BOARD_SECTION_LIMIT:
+            lines.append(f"… 共 {len(tasks)} 条")
+
     render_section("🔄 进行中", running,
                    key=lambda x: x.get("started_at") or x.get("created_at") or "", with_id=True)
+    render_decision_section(decisions)
     render_waiting_section(waiting)
     render_section("❌ 失败", errors,
                    key=lambda x: x.get("completed_at") or x.get("created_at") or "", with_id=True)
@@ -1158,6 +1697,8 @@ def build_agent_card(state, agent_id):
                if t["agent"] == agent_id and t["status"] == "running"]
     waiting = [t for t in state["tasks"].values()
                if t["agent"] == agent_id and t["status"] == "waiting_retry"]
+    decisions = [t for t in state["tasks"].values()
+                 if t["agent"] == agent_id and t["status"] == "waiting_decision"]
     lines.append("\n**🔄 正在处理**")
     if running:
         for t in running:
@@ -1168,6 +1709,16 @@ def build_agent_card(state, agent_id):
                 lines.append(f"   └ run `{t['run_id'][:16]}…`")
             if t.get("summary"):
                 lines.append(f"   └ {t['summary'][:80]}")
+    else:
+        lines.append("无")
+
+    lines.append("\n**🗳️ 待决事项（等待用户决策）**")
+    if decisions:
+        for t in decisions:
+            d = t.get("decision") or {}
+            lines.append(f"**{t['title']}** · `{t['id']}`")
+            lines.append(f"   └ 问题：{(d.get('question') or '')[:80]}")
+            lines.append(f"   └ 限时 {d.get('timeout_at') or '未知'} · 未决默认 {d.get('default_action') or '-'}")
     else:
         lines.append("无")
 
@@ -1304,7 +1855,7 @@ def dispatch_natural(text):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: BOARD_ACCOUNT=<bot01|bot02|...> [BOARD_OPEN_ID=<open_id>] pipeline.py <board|agent-detail|start|assign|dispatch|complete|review|stop|release|set-result|record-run|fail|error|retry-due|detail|history|clear> [args]")
+        print("Usage: BOARD_ACCOUNT=<bot01|bot02|...> [BOARD_OPEN_ID=<open_id>] pipeline.py <board|agent-detail|start|assign|dispatch|complete|review|stop|release|set-result|record-run|fail|error|retry-due|request-decision|decide|sweep|detail|history|clear> [args]")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -1388,9 +1939,67 @@ def main():
         result = error_task(sys.argv[2], " ".join(sys.argv[3:]))
         print(json.dumps(result, indent=2, ensure_ascii=False))
     elif cmd == "retry-due":
-        # O2：退避到期扫描（sweep），由 cron 定期驱动；幂等，无参
+        # O2/O6：退避到期 + 决策限时扫描（sweep），由 cron 定期驱动；幂等，无参
         result = retry_due_tasks()
         print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif cmd == "request-decision":
+        # O6：挂起任务等待用户决策（决策卡经 feishu_card.py 发送）
+        if len(sys.argv) < 4:
+            print("Usage: pipeline.py request-decision <task_id> <question> "
+                  "[--options a,b,c] [--tier low|medium|high] "
+                  "[--default approve|reject] [--timeout seconds]")
+            sys.exit(1)
+        task_id = sys.argv[2]
+        question = sys.argv[3]
+        opts = []
+        tier = None
+        default_action = None
+        timeout_seconds = None
+        i = 4
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if arg == "--options" and i + 1 < len(sys.argv):
+                opts = [x.strip() for x in sys.argv[i + 1].split(",") if x.strip()]
+                i += 2
+            elif arg == "--tier" and i + 1 < len(sys.argv):
+                tier = sys.argv[i + 1]
+                i += 2
+            elif arg == "--default" and i + 1 < len(sys.argv):
+                default_action = sys.argv[i + 1]
+                i += 2
+            elif arg == "--timeout" and i + 1 < len(sys.argv):
+                try:
+                    timeout_seconds = int(sys.argv[i + 1])
+                except ValueError:
+                    print("Usage: --timeout 必须是整数秒")
+                    sys.exit(1)
+                i += 2
+            else:
+                print(f"未知参数：{arg}")
+                sys.exit(1)
+        result = request_decision(task_id, question, options=opts, tier=tier,
+                                  default_action=default_action,
+                                  timeout_seconds=timeout_seconds)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif cmd == "decide":
+        # O6：用户拍板入口（卡片回调与手工命令共用）
+        if len(sys.argv) < 4:
+            print("Usage: pipeline.py decide <task_id> approve|reject|defer [--source <来源>]")
+            sys.exit(1)
+        source = "cli"
+        if "--source" in sys.argv:
+            idx = sys.argv.index("--source")
+            if idx + 1 < len(sys.argv):
+                source = sys.argv[idx + 1]
+                sys.argv = sys.argv[:idx] + sys.argv[idx + 2:]
+        result = decide_task(sys.argv[2], sys.argv[3], source=source)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif cmd == "sweep":
+        # O7b：巡检产出 findings（四类）；--notify 经 feishu_card.py 发告警卡
+        notify = "--notify" in sys.argv
+        result = sweep_tasks(notify=notify)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        print(result["summary"], file=sys.stderr)
     elif cmd == "detail":
         if len(sys.argv) < 3:
             print("Usage: pipeline.py detail <task_id>")

@@ -104,8 +104,12 @@ python3 scripts/pipeline.py set-result <task_id> <结果> [摘要]  # 保存结�
 python3 scripts/pipeline.py complete <task_id>         # 完成任务（自动推进流水线下一阶段）
 python3 scripts/pipeline.py review <task_id>           # 提交审核
 python3 scripts/pipeline.py stop <task_id>             # 停止任务
-python3 scripts/pipeline.py fail <task_id> <错误>      # 失败（可重试）
+python3 scripts/pipeline.py fail <task_id> <错误>      # 失败（瞬时错误自动退避重试）
 python3 scripts/pipeline.py error <task_id> <错误>     # 失败（不可重试）
+python3 scripts/pipeline.py retry-due                  # 退避到期+决策限时扫描（cron 驱动，幂等）
+python3 scripts/pipeline.py request-decision <task_id> <问题> [--options a,b] [--tier low|medium|high]  # 挂起等待用户决策（发决策卡）
+python3 scripts/pipeline.py decide <task_id> approve|reject|defer  # 用户拍板入口
+python3 scripts/pipeline.py sweep [--notify]           # 巡检：四类异常 findings（可选发告警卡，幂等去重）
 python3 scripts/pipeline.py release <agent_id>         # 释放猴
 python3 scripts/pipeline.py detail <task_id>           # 任务详情
 python3 scripts/pipeline.py history                    # 历史任务
@@ -126,14 +130,19 @@ BOARD_ACCOUNT=bot01 python3 scripts/feishu_card.py --update <message_id> ['{"sta
 
 ### fail/retry 行为说明
 
-- `fail <task_id> <错误>` 用于瞬时错误（限流/超时/5xx/配额等）。任务**保持 running**（内部经 pending 重新分配），看板 summary 标注「上次失败，准备自动重试 N/M」，`attempts` 递增；
-- 不存在独立的 `waiting_retry` 中间态：`fail` 返回 `retry=true` 后，由**编排方（协调猴）**负责用 `sessions_spawn(agentId=...)` 重新拉起子会话继续任务；
+- `fail <task_id> <错误>` 自动分类：**瞬时错误**（限流/超时/5xx/配额等关键词）→ 任务转 `waiting_retry` 状态并记 `next_retry_at`（默认退避 1800s，team.json `retry_backoff_seconds` 可配），**attempts 不增**；**非瞬时错误**（权限/配置类）→ 直接转 `error` 终态不重试；
+- 到期启动由外部 cron 调 `retry-due` 驱动：任务真启动时 attempts 才 +1（账实相符），同时把限时未决的 `waiting_decision` 任务按默认策略执行并留痕；
 - 重试耗尽（默认 `max_attempts=3`，可在 team.json 配置）后任务转 **error** 终态，需人工介入；
 - 权限/配置类错误请用 `error`（不可自动重试），避免无意义的反复重试。
 
+### 决策等待与巡检（O6/O7b）
+
+- `request-decision` 把任务挂起为 `waiting_decision`（agent 释放，并行线不阻塞），决策卡经 `scripts/feishu_card.py` 发送（批准/否决/转交三按钮，档位文案全部经 team.json `decision`/`decision_card` 段配置化）；`decide approve|reject|defer` 为卡片回调与手工命令共用入口，决策记录写入 `task.decision.log` 留痕；
+- `sweep` 产出四类 findings：`stale_running`（running 超阈值无进展，默认 2h）、`pending_aged`（待分配超龄）、`retry_overdue`（退避超期未拉起）、`ledger_no_progress`（run_id 已登记但长期无进展）；`--notify` 发告警卡（凭据缺失静默），同一 finding 未消除前不重复告警（sweep-state 指纹去重）。
+
 ## 冒烟验收边界
 
-- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；`tests/setup_test.py` 验证 setup.py 骨架生成 / 幂等 / `--apply` 备份（均为临时目录虚构配置，不碰仓库 config/）；`tests/deploy_smoke_test.py` 端到端验证一键部署闭环（deploy.sh 真实执行 + 状态机全闭环 + revision 乐观锁 / waiting_retry 退避 / retry-due 幂等新机制 + feishu_card.py 卡片渲染与发送路径 mock）；`tests/mirror_test.py` 用 mock RPC 验证镜像层状态映射 / 红线断言 / 主链路 / 失败降级（不依赖真实 gateway）；
+- 本仓库 `tests/smoke_test.py` 用虚构 team.json + mock 卡片发送，可离线跑通 `board / assign / set-result / complete` 状态机闭环（不发真实飞书消息）；`tests/doctor_test.py` 用虚构配置验证 doctor 全绿 / 缺配置两条路径；`tests/setup_test.py` 验证 setup.py 骨架生成 / 幂等 / `--apply` 备份（均为临时目录虚构配置，不碰仓库 config/）；`tests/deploy_smoke_test.py` 端到端验证一键部署闭环（deploy.sh 真实执行 + 状态机全闭环 + revision 乐观锁 / waiting_retry 退避 / retry-due 幂等新机制 + feishu_card.py 卡片渲染与发送路径 mock）；`tests/mirror_test.py` 用 mock RPC 验证镜像层状态映射 / 红线断言 / 主链路 / 失败降级（不依赖真实 gateway）；`tests/decision_sweep_test.py` 验证批次 3 机制：waiting_decision 挂起/决策卡三按钮/approve·reject·defer 流转/限时默认策略留痕 + sweep 四类 findings 命中与幂等去重（均 mock，不发真实消息）；
 - 真实飞书卡片收发需要有效应用凭证与 open_id：未配置凭证时 `board` 等涉及卡片的命令会在发送阶段报错，属预期行为——请先按「快速上手」配置。
 
 ## 常见问题 FAQ

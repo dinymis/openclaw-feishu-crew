@@ -22,5 +22,32 @@
   },
   "card": {
     "board_title": "🤖 {engineer}智能体 · 多Agent任务看板"
+  },
+  "_decision_comment": "O6 决策等待：限时未否决按 default_action 执行；tiers 档位文案可全量覆盖",
+  "decision": {
+    "timeout_seconds": 86400,
+    "default_action": "approve",
+    "tiers": {
+      "low": {"label": "低危可逆 · 默认批准", "default_action": "approve", "timeout_seconds": 3600},
+      "medium": {"label": "中危 · 限时未否决按默认策略执行", "default_action": "approve", "timeout_seconds": 86400},
+      "high": {"label": "高危 · 默认否决（需明确批准）", "default_action": "reject", "timeout_seconds": 86400}
+    }
+  },
+  "_decision_card_comment": "O6 决策卡文案（按钮/标题均可定制）",
+  "decision_card": {
+    "header_title": "🗳️ 任务决策待批",
+    "approve_button": "✅ 批准",
+    "reject_button": "❌ 否决",
+    "defer_button": "↔️ 转交"
+  },
+  "_sweep_comment": "O7b 巡检阈值（秒）：running 无进展/待分配超龄/重试宽限",
+  "sweep": {
+    "stale_running_seconds": 7200,
+    "pending_age_seconds": 21600,
+    "waiting_retry_grace_seconds": 1800
+  },
+  "_alert_card_comment": "O7b 巡检告警卡文案",
+  "alert_card": {
+    "header_title": "🚨 流水线巡检告警"
   }
 }

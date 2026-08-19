@@ -38,3 +38,6 @@ jobs:
 
       - name: 运行 deploy.sh 端到端冒烟（一键部署闭环 + 新机制断言）
         run: python3 tests/deploy_smoke_test.py
+
+      - name: 运行批次 3 验收（O6 决策卡 + O7b 巡检）
+        run: python3 tests/decision_sweep_test.py

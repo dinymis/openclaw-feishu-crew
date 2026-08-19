@@ -42,6 +42,8 @@ openclaw gateway restart                                    # （若未带 --res
 | `tests/deploy_smoke_test.py` | 一键部署端到端冒烟（deploy.sh 闭环 + revision/waiting_retry/retry-due 新机制 + 卡片渲染 mock） | 改完 deploy.sh 或验证部署闭环后跑通 |
 | `tests/doctor_test.py` | doctor / add-engineer / --fix 自测 | 改完 doctor 或 add-engineer 后跑通 |
 | `tests/setup_test.py` | setup.py 一键初始化自测（骨架/幂等/--apply 备份） | 改完 setup.py 后跑通 |
+| `tests/mirror_test.py` | 镜像层自测（八态映射 + 红线断言 + mock RPC 主链路/降级） | 改完 workboard-mirror.py 后跑通 |
+| `tests/decision_sweep_test.py` | 批次 3 验收：waiting_decision 决策卡 + approve/reject/defer 流转 + sweep 四类 findings + 幂等去重 | 改完决策/巡检机制后跑通 |
 | `CONTRIBUTING.md` | 贡献约定（零依赖/脱敏/提交流程） | 准备提交改动时 |
 | `CODE_OF_CONDUCT.md` / `LICENSE` | 社区准则 / MIT 许可 | 几乎不需要读 |
 
@@ -76,7 +78,7 @@ python3 scripts/pipeline.py assign <agent_id> <标题>    # 派活
 python3 scripts/pipeline.py complete <task_id>          # 完成
 python3 scripts/pipeline.py detail <task_id>            # 详情
 # 完整命令见 README「命令速查」
-python3 tests/deploy_smoke_test.py && python3 tests/smoke_test.py && python3 tests/doctor_test.py && python3 tests/setup_test.py
+python3 tests/deploy_smoke_test.py && python3 tests/smoke_test.py && python3 tests/doctor_test.py && python3 tests/setup_test.py && python3 tests/mirror_test.py && python3 tests/decision_sweep_test.py
 ```
 
 ## 部署就绪判定
@@ -86,4 +88,4 @@ python3 tests/deploy_smoke_test.py && python3 tests/smoke_test.py && python3 tes
 1. `python3 scripts/doctor.py`（联网）全绿；
 2. `openclaw gateway restart` 成功；
 3. 对任一 bot 说「看板」能收到第一张卡片；
-4. `python3 tests/deploy_smoke_test.py`、`tests/smoke_test.py`、`tests/doctor_test.py`、`tests/setup_test.py` 全绿。
+4. `python3 tests/deploy_smoke_test.py`、`tests/smoke_test.py`、`tests/doctor_test.py`、`tests/setup_test.py`、`tests/mirror_test.py`、`tests/decision_sweep_test.py` 全绿。

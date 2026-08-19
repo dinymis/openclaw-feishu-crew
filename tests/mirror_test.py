@@ -8,7 +8,7 @@
     python3 tests/mirror_test.py
 
 覆盖：
-    1. STATUS_MAP 六态映射正确性（stopped/error → blocked 等）；
+    1. STATUS_MAP 八态映射正确性（stopped/error/waiting_retry/waiting_decision → blocked 等）；
     2. 红线断言：dispatch/ready/sessionKey 触发 RuntimeError；
     3. sync_task 主链路：boards.upsert → cards.create → cards.move →
        cards.update，done 迁移附带 comment；
@@ -131,6 +131,7 @@ check(wm.STATUS_MAP["done"] == "done", "done -> done")
 check(wm.STATUS_MAP["stopped"] == "blocked", "stopped -> blocked")
 check(wm.STATUS_MAP["error"] == "blocked", "error -> blocked")
 check(wm.STATUS_MAP["waiting_retry"] == "blocked", "waiting_retry -> blocked")
+check(wm.STATUS_MAP["waiting_decision"] == "blocked", "waiting_decision -> blocked")
 check(wm.ALLOWED_WB_STATUS == {"todo", "running", "review", "blocked", "done"},
       "镜像卡只允许五态（R1/R4）")
 
@@ -181,6 +182,19 @@ ms = methods_called()
 check("workboard.cards.comment" in ms, "done 迁移附带 comment")
 move_params = next(p for m, p in CALLS if m == "workboard.cards.move")
 check(move_params.get("status") == "done", "done 任务 move 到 done")
+
+# O6：waiting_decision → blocked + label + 决策 comment
+CALLS.clear()
+set_task_status("waiting_decision",
+                decision={"question": "示例决策问题", "timeout_at": "2026-08-19 18:00:00",
+                          "default_action": "approve"})
+wm.sync_task("bot01", TASK_ID)
+ms = methods_called()
+move_params = next(p for m, p in CALLS if m == "workboard.cards.move")
+check(move_params.get("status") == "blocked", "waiting_decision 任务 move 到 blocked")
+update_params = next(p for m, p in CALLS if m == "workboard.cards.update")
+check("pipe:waiting_decision" in update_params["patch"]["labels"], "waiting_decision 带 label")
+check("workboard.cards.comment" in ms, "waiting_decision 迁移附带决策 comment")
 
 print("== 4. 失败降级与 pending_ops 补同步 ==")
 wm.subprocess.run = make_fake_run(fail=True)  # 模拟 gateway 不可达

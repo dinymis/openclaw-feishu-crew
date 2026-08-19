@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 task-state*.json
 task-state*.json.bak.*
+sweep-state*.json
+workboard-mirror*.json
 openclaw-workspace-state.json
 media/
 
